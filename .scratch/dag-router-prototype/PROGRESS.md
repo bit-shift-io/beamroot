@@ -78,3 +78,28 @@ Lint: none configured
 - Conventions confirmed: matplotlib Agg backend, no Graphviz binary. pyproject pins `numpy<2`, `matplotlib<3.10` (3.9.4), plus networkx, jinja2; templates/*.html declared as package data.
 - Surprises: `pip install matplotlib` pulled numpy 2.x, which breaks torch 2.2.2 — any new dep must keep numpy<2. Auto-report adds ~28s to a dag MNIST run (eats into 5-min budget). Pytest now shows 14 PyparsingDeprecationWarnings from matplotlib internals (harmless). Diagram makes the slice-05 50/50 split-router problem visible.
 - Built by: slice-implementer · sonnet · 47490 · verification passed first time
+
+## Slice 07 — cifar10-and-comparison
+- Built: `--dataset cifar10` for both models (crop+flip train-only aug), per-dataset dims table, param-matched baseline (`--match-params`), group purity + baseline row in report. Real CIFAR DAG: 17:46 incl. auto-report, soft 0.7741, beam1 0.7486 (3 nodes), 7 nodes, 2,909,230 params. Matched baseline: 0.6150, 2,912,218 params, ~27 min. Runs: runs/20261024-154201-cifar10-dag-slice07-full/, runs/20261024-160033-cifar10-baseline-slice07/ (leftover reportless runs/20261024-152955-cifar10-dag-slice07/)
+- Files touched: beamroot/{data,train,report,analysis}.py, beamroot/models/baseline.py, beamroot/templates/report.html, tests/test_param_match.py (new), tests/test_analysis.py, tests/test_report.py (dag.py unchanged — stem already handles 32×32 via image_size//4)
+- New exports/interfaces:
+  - `beamroot.data.dataset_info(name)` (channels, image size, classes, default width, default epochs, groups), `DATASETS`, `CIFAR10_GROUPS`, `CIFAR10_CLASSES`; datasets mnist, synthetic, cifar10, synthetic_cifar (offline 3×32×32)
+  - `beamroot.models.baseline.count_params(model)`, `match_width(target, in_channels, image_size, num_classes) -> (width, hidden)`, `BaselineCNN(..., hidden=128)`
+  - `beamroot.train.build_model(name, dataset="mnist", width=None, hidden=None)`, `matched_size(run_dir, dataset)`; flags `--width --hidden --match-params <dag-run>`; `--epochs` defaults per dataset (5 mnist/synthetic, 15 cifar10)
+  - `beamroot.report.baseline_summary(run_dir)`; report flag `--baseline <run-dir>` / `render_report(..., baseline=...)`; groups read from run config when None
+  - config.json records `params`; growing dag runs rewrite it with the final count
+- Conventions confirmed: per-dataset settings live in data.DATASETS.
+- Surprises: slice-06 `collect_stats` crashed on MPS (`.double()` on MPS tensor) — fixed with `.cpu().double()`; no MPS test coverage. CIFAR report step ~3.5 min (evaluate_modes beams on 10k). Matched baseline slower per epoch than DAG (wide stem). Split routers still ~50/50, entropy ~0.68 on CIFAR. README still lacks new flags.
+- Built by: slice-implementer · sonnet · 67840 · verification passed first time
+
+## Slice 08 — merging
+- Built: `--merge` / `--merge-threshold` (default 0.05 symmetric KL) merge check before each split; merge + prune in graph and model; growth.jsonl merge or no-merge events; merged nodes marked in graph.png/report.html. Sibling (shared-parent) pairs skipped. Real MNIST `--merge`: no candidates at all (7-node chain) → logged no-merge every step; matches slice 05 exactly. With `--max-nodes 9`: cousin candidates leaf3+leaf6 KL 12.92, leaf3+leaf7 13.19 — no merge.
+- Files touched: beamroot/models/graph.py, beamroot/growth.py, beamroot/train.py (flags), beamroot/report.py, beamroot/templates/report.html, tests/test_merge.py (new)
+- New exports/interfaces:
+  - `RouterGraph.merge(keep, drop) -> list[str]` (ValueError: same node / mixed kind / shared parent / ancestor pair), `RouterGraph.prune_unreachable(root) -> list[str]`
+  - `beamroot.growth.node_outputs(model, route_out)`, `candidate_pairs(graph) -> [(keep, drop)]`, `merge_candidates(model, loader, device, limit_batches=None) -> [(sym_kl, keep, drop)]`, `merge_nodes(model, keep, drop) -> removed`, `merge_step(model, loader, device, epoch, run_dir, threshold, limit_batches=None) -> [event]`
+  - Events: `{epoch, merge: [keep, drop], kl, removed, num_nodes, threshold}` / `{epoch, merge: null, threshold, candidates: {"a+b": kl}}`
+  - Report: purity_rows gain `parents`, `merged`; template gets `num_merged`
+- Conventions confirmed: merge report tests live in test_merge.py.
+- Surprises: (1) splitting makes chains, so under the slice's rules a default 7-node run never has a merge candidate; real cousin pairs at 9 nodes are ~13 nats apart — merging never fires in practice; worth-keeping is a human decision. (2) merge KL measured on the test loader (no validation split) — mild test-set leak into structure. (3) candidate KL is not reach-weighted. (4) README lacks new flags.
+- Built by: slice-implementer · opus (inherited) · 74517 · verification passed first time

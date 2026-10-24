@@ -6,6 +6,8 @@ from pathlib import Path
 
 import torch
 
+from beamroot.analysis import node_depths
+
 
 def leaf_losses(model, loader, device, limit_batches=None) -> dict[str, float]:
     """Per-leaf reach-weighted loss: mean over samples of reach(leaf) * NLL(leaf, label).
@@ -50,6 +52,109 @@ def split_leaf(model, name: str, noise: float = 1e-3) -> tuple[str, str]:
                 p.add_(torch.randn_like(p) * noise)
         model.nodes[n] = leaf
     return new
+
+
+def node_outputs(model, out: dict) -> dict:
+    """{node: (B, C)} log class distribution of each node's sub-DAG, given it was reached.
+
+    A leaf's is its own prediction; a router's mixes its children's by its routing probs.
+    `out` is the result of `model.route(x)`.
+    """
+    graph, res = model.graph, {}
+    for name in reversed(graph.topological_order()):
+        if graph.nodes[name].kind == "leaf":
+            res[name] = out["leaf_log_probs"][name]
+        else:
+            kids = torch.stack([res[c] for c in graph.children(name)], dim=1)  # (B, k, C)
+            res[name] = torch.logsumexp(out["log_route"][name][:, :, None] + kids, dim=1)
+    return res
+
+
+def candidate_pairs(graph) -> list[tuple[str, str]]:
+    """(keep, drop) pairs that may merge: same depth (longest path), same kind, no shared
+    parent, neither an ancestor of the other. `keep` is the earlier one topologically.
+
+    Siblings are excluded: merging them would need one router output column to vanish,
+    and every fresh split's two near-identical leaves would merge straight back.
+    """
+    depth, order = node_depths(graph), graph.topological_order()
+    pairs = []
+    for i, a in enumerate(order):
+        for b in order[i + 1:]:
+            if (depth[a] != depth[b] or graph.nodes[a].kind != graph.nodes[b].kind
+                    or set(graph.parents(a)) & set(graph.parents(b))
+                    or b in graph.descendants(a) or a in graph.descendants(b)):
+                continue
+            pairs.append((a, b))
+    return pairs
+
+
+def merge_candidates(model, loader, device, limit_batches=None) -> list[tuple[float, str, str]]:
+    """[(symmetric KL, keep, drop)] for every candidate pair, closest first.
+
+    KL is between the two nodes' sub-DAG class distributions, averaged over samples
+    (eval mode, no gradients).
+    """
+    pairs = candidate_pairs(model.graph)
+    if not pairs:
+        return []
+    was_training = model.training
+    model.eval()
+    sums, total = {p: 0.0 for p in pairs}, 0
+    with torch.no_grad():
+        for x, _ in islice(loader, limit_batches):
+            outs = node_outputs(model, model.route(x.to(device)))
+            for a, b in pairs:
+                la, lb = outs[a], outs[b]
+                skl = ((la.exp() - lb.exp()) * (la - lb)).sum(1)  # KL(a||b) + KL(b||a)
+                sums[(a, b)] += skl.sum().item()
+            total += x.shape[0]
+    model.train(was_training)
+    return sorted((s / max(total, 1), a, b) for (a, b), s in sums.items())
+
+
+def merge_nodes(model, keep: str, drop: str) -> list[str]:
+    """Merge node `drop` into `keep` in a DAGRouterModel, in place (see RouterGraph.merge).
+
+    Removes the modules of `drop` and of every node left unreachable; returns their names.
+    Routers keep their output width because redirected edges keep their column.
+    """
+    removed = model.graph.merge(keep, drop)
+    for n in removed:
+        del model.nodes[n]
+    return removed
+
+
+def merge_step(model, loader, device, epoch: int, run_dir, threshold: float,
+               limit_batches=None) -> list[dict]:
+    """Merge growth step: repeatedly merge the closest candidate pair while its
+    symmetric KL is below `threshold`, re-measuring after each merge.
+
+    Each merge appends an event to <run_dir>/growth.jsonl; if nothing merges, one
+    `"merge": null` line records the threshold and every candidate's KL instead.
+    Writes a graph snapshot after any merge. Returns the merge events.
+    """
+    events = []
+    while True:
+        cands = merge_candidates(model, loader, device, limit_batches)
+        if not cands or cands[0][0] >= threshold:
+            break
+        kl, keep, drop = cands[0]
+        removed = merge_nodes(model, keep, drop)
+        events.append({"epoch": epoch, "merge": [keep, drop], "kl": kl, "removed": removed,
+                       "num_nodes": len(model.graph.nodes), "threshold": threshold})
+        _log_event(run_dir, events[-1])
+    if events:
+        save_graph_snapshot(model, run_dir, epoch)
+    else:
+        _log_event(run_dir, {"epoch": epoch, "merge": None, "threshold": threshold,
+                             "candidates": {f"{a}+{b}": kl for kl, a, b in cands}})
+    return events
+
+
+def _log_event(run_dir, event: dict) -> None:
+    with open(Path(run_dir) / "growth.jsonl", "a") as f:
+        f.write(json.dumps(event) + "\n")
 
 
 def rebuild_optimizer(model, opt: torch.optim.Optimizer) -> torch.optim.Optimizer:

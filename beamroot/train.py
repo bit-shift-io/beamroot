@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from beamroot.data import dataset_info, get_loaders
 from beamroot.device import select_device
-from beamroot.growth import grow, rebuild_optimizer, save_graph_snapshot
+from beamroot.growth import grow, merge_step, rebuild_optimizer, save_graph_snapshot
 from beamroot.losses import balance_loss, router_usage, routing_entropy
 from beamroot.models.baseline import BaselineCNN, count_params, match_width
 from beamroot.models.dag import DAGRouterModel
@@ -127,10 +127,20 @@ def run(args) -> dict:
         print(f"epoch {epoch}: loss {last['loss']:.4f} test_acc {acc:.4f}", flush=True)
         # Grow after training on the current graph; never after the last epoch.
         if growing and epoch % args.grow_every == 0 and epoch < args.epochs:
+            merges = []
+            if args.merge:  # merge first so freed nodes count towards the split budget
+                merges = merge_step(model, test_loader, device, epoch, run_dir,
+                                    args.merge_threshold, limit_batches=args.growth_batches)
+                for m in merges:
+                    print(f"  merge {m['merge'][1]} into {m['merge'][0]} (sym KL {m['kl']:.4f}), "
+                          f"removed {m['removed']} ({m['num_nodes']} nodes)", flush=True)
+                if not merges:
+                    print(f"  merge: no pair below sym KL {args.merge_threshold}", flush=True)
             event = grow(model, train_loader, device, epoch, run_dir, args.max_nodes,
                          limit_batches=args.growth_batches)
-            if event:
+            if event or merges:
                 opt = rebuild_optimizer(model, opt)
+            if event:
                 print(f"  split {event['split']} -> {event['new_nodes']} "
                       f"({event['num_nodes']} nodes)", flush=True)
     torch.save(save_payload(model), run_dir / "model.pt")
@@ -165,6 +175,11 @@ def parse_args(argv=None):
                    help="dag only: stop growing when a split would exceed this many graph nodes")
     p.add_argument("--growth-batches", type=int, default=50,
                    help="training batches used to measure per-leaf loss before a split")
+    p.add_argument("--merge", action="store_true",
+                   help="dag only: at each growth step, first merge same-depth node pairs whose "
+                        "outputs on held-out data are near-identical")
+    p.add_argument("--merge-threshold", type=float, default=0.05,
+                   help="merge pairs whose mean symmetric KL is below this (nats)")
     p.add_argument("--no-report", action="store_true",
                    help="dag only: skip writing graph.png and report.html at the end of the run")
     p.add_argument("--limit-batches", type=int, default=None)

@@ -46,6 +46,8 @@ def node_labels(graph, class_mass, groups=None) -> dict[str, str]:
     for name in graph.nodes:
         dom, pur = purity(class_mass[name], groups)
         labels[name] = f"{name}\n{'-' if dom is None else dom} {pur:.0%}"
+        if len(graph.parents(name)) > 1:
+            labels[name] += "\nmerged: " + "+".join(graph.parents(name))
     return labels
 
 
@@ -63,11 +65,15 @@ def draw_graph(graph, edge_prob, labels, path=None) -> bytes:
     g.add_nodes_from(graph.nodes)
     g.add_edges_from(graph.edges)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=100)
-    colors = ["#cfe8ff" if graph.nodes[n].kind == "router" else "#d8f0d0" for n in g.nodes]
+    # Merged (multi-parent) nodes get a warm fill and a thick border.
+    merged = {n for n in g.nodes if len(graph.parents(n)) > 1}
+    colors = ["#ffd8a8" if n in merged else "#cfe8ff" if graph.nodes[n].kind == "router"
+              else "#d8f0d0" for n in g.nodes]
+    borders = [2.5 if n in merged else 1.0 for n in g.nodes]
     nx.draw_networkx_edges(g, pos, ax=ax, arrows=True, arrowsize=10, edge_color="#666",
                            node_size=2600, node_shape="s")
     nx.draw_networkx_nodes(g, pos, ax=ax, node_color=colors, node_shape="s", node_size=2600,
-                           edgecolors="#333")
+                           edgecolors="#333", linewidths=borders)
     nx.draw_networkx_labels(g, pos, labels=labels, ax=ax, font_size=7)
     nx.draw_networkx_edge_labels(
         g, pos, ax=ax, edge_labels={e: f"{p:.2f}" for e, p in edge_prob.items()},
@@ -152,7 +158,8 @@ def render_report(run_dir, device=None, samples=8, beam=3, beams=(1, 3, 5),
     rows = evaluate_modes(model, test_loader, device, beams, limit_batches)
     stats = collect_stats(model, test_loader, device, model.num_classes, limit_batches)
     labels = node_labels(graph, stats["class_mass"], groups)
-    purity_rows = [{"node": n, "kind": graph.nodes[n].kind,
+    purity_rows = [{"node": n, "kind": graph.nodes[n].kind, "parents": graph.parents(n),
+                    "merged": len(graph.parents(n)) > 1,
                     "class": purity(stats["class_mass"][n])[0],
                     "class_purity": purity(stats["class_mass"][n])[1],
                     "group": purity(stats["class_mass"][n], groups)[0] if groups else None,
@@ -176,6 +183,7 @@ def render_report(run_dir, device=None, samples=8, beam=3, beams=(1, 3, 5),
     env = Environment(loader=FileSystemLoader(TEMPLATE_DIR), autoescape=select_autoescape())
     html = env.get_template("report.html").render(
         run_name=run_dir.name, config=config, num_nodes=len(graph.nodes), rows=rows,
+        num_merged=sum(r["merged"] for r in purity_rows),
         graph_png=_b64(graph_png), hist_png=_b64(hist_png), samples=sample_ctx, beam=beam,
         purity_label=purity_label, purity_rows=purity_rows, has_groups=groups is not None,
         baseline=baseline_ctx, dag_params=config.get("params"))

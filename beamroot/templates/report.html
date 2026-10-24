@@ -17,7 +17,7 @@ img { max-width: 100%; }
 </head>
 <body>
 <h1>{{ run_name }}</h1>
-<p>{{ config.dataset }} / {{ config.model }}, seed {{ config.seed }}, {{ num_nodes }} nodes.</p>
+<p>{{ config.dataset }} / {{ config.model }}, seed {{ config.seed }}, {{ num_nodes }} nodes, {{ num_merged }} merged node{{ "" if num_merged == 1 else "s" }}.</p>
 
 <h2 id="accuracy">Accuracy</h2>
 <table>
@@ -32,7 +32,8 @@ img { max-width: 100%; }
 {% if baseline %}<p>Baseline run {{ baseline.name }}; DAG has {{ dag_params }} params.</p>{% endif %}
 
 <h2 id="graph">Router graph</h2>
-<p>Nodes show the dominant {{ purity_label }} and its purity; edges show the mean routing probability.</p>
+<p>Nodes show the dominant {{ purity_label }} and its purity; edges show the mean routing probability.
+Merged nodes (more than one parent) are orange with a thick border and list their parents.</p>
 <img alt="router graph" src="data:image/png;base64,{{ graph_png }}">
 
 <h2 id="samples">Sample paths (beam {{ beam }})</h2>
@@ -50,9 +51,9 @@ img { max-width: 100%; }
 
 <h2 id="purity">Per-node purity</h2>
 <table>
-<tr><th>node</th><th>kind</th><th>dominant class</th><th>class purity</th>{% if has_groups %}<th>group</th><th>group purity</th>{% endif %}</tr>
+<tr><th>node</th><th>kind</th><th>parents</th><th>dominant class</th><th>class purity</th>{% if has_groups %}<th>group</th><th>group purity</th>{% endif %}</tr>
 {% for r in purity_rows %}
-<tr><td>{{ r.node }}</td><td>{{ r.kind }}</td><td>{{ r["class"] }}</td><td>{{ "%.1f%%"|format(r.class_purity * 100) }}</td>{% if has_groups %}<td>{{ r.group }}</td><td>{{ "%.1f%%"|format(r.group_purity * 100) }}</td>{% endif %}</tr>
+<tr><td>{{ r.node }}</td><td>{{ r.kind }}{% if r.merged %} (merged){% endif %}</td><td>{{ r.parents|join(", ") or "-" }}</td><td>{{ r["class"] }}</td><td>{{ "%.1f%%"|format(r.class_purity * 100) }}</td>{% if has_groups %}<td>{{ r.group }}</td><td>{{ "%.1f%%"|format(r.group_purity * 100) }}</td>{% endif %}</tr>
 {% endfor %}
 </table>
 
