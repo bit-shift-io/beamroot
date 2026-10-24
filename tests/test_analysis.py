@@ -1,0 +1,87 @@
+import pytest
+import torch
+
+from beamroot.analysis import collect_stats, node_depths, purity
+from beamroot.models.dag import DAGRouterModel
+from beamroot.models.graph import RouterGraph
+
+
+def diamond():
+    """root -> a, b; a -> la, shared; b -> shared, lb."""
+    g = RouterGraph()
+    g.add_node("root", "router")
+    g.add_node("a", "router", parents=["root"])
+    g.add_node("b", "router", parents=["root"])
+    g.add_node("la", "leaf", parents=["a"])
+    g.add_node("shared", "leaf", parents=["a", "b"])
+    g.add_node("lb", "leaf", parents=["b"])
+    return g
+
+
+def force(model, name, probs):
+    out = model.nodes[name].out
+    with torch.no_grad():
+        out.weight.zero_()
+        out.bias.copy_(torch.tensor(probs).log())
+
+
+def test_purity_is_share_of_dominant_class():
+    assert purity([6.0, 2.0, 2.0]) == (0, pytest.approx(0.6))
+
+
+def test_purity_with_class_groups_uses_group_mass():
+    groups = {0: "animal", 1: "animal", 2: "vehicle"}
+    assert purity([3.0, 3.0, 2.0], groups) == ("animal", pytest.approx(0.75))
+
+
+def test_purity_of_empty_node_is_none():
+    assert purity([0.0, 0.0]) == (None, 0.0)
+
+
+def test_node_depth_is_longest_path_from_root():
+    g = diamond()
+    d = node_depths(g)
+    assert d == {"root": 0, "a": 1, "b": 1, "la": 2, "shared": 2, "lb": 2}
+    g.split("shared")  # shared becomes a router, children at depth 3
+    d = node_depths(g)
+    assert d["shared"] == 2 and all(d[c] == 3 for c in g.children("shared"))
+
+
+def test_node_depth_uses_longest_path_when_parents_differ_in_depth():
+    g = RouterGraph()
+    g.add_node("root", "router")
+    g.add_node("r", "router", parents=["root"])
+    g.add_node("x", "leaf", parents=["root", "r"])
+    g.add_node("y", "leaf", parents=["r"])
+    assert node_depths(g)["x"] == 2
+
+
+def test_collect_stats_class_mass_is_reach_weighted_and_edges_are_mean_probs():
+    torch.manual_seed(0)
+    model = DAGRouterModel(graph=diamond()).eval()
+    force(model, "root", [0.75, 0.25])
+    force(model, "a", [0.5, 0.5])
+    force(model, "b", [0.2, 0.8])
+    x = torch.randn(4, 1, 28, 28)
+    y = torch.tensor([0, 0, 1, 2])
+    stats = collect_stats(model, [(x, y)], "cpu", num_classes=10)
+    mass = stats["class_mass"]
+    # root sees every sample; a sees 0.75 of each; shared sees 0.375 + 0.05 of each
+    assert mass["root"][0] == pytest.approx(2.0)
+    assert mass["a"][0] == pytest.approx(1.5)
+    assert mass["a"][1] == pytest.approx(0.75)
+    assert mass["shared"][0] == pytest.approx(2 * (0.375 + 0.05))
+    assert mass["lb"][2] == pytest.approx(0.2)
+    assert stats["edge_prob"][("root", "a")] == pytest.approx(0.75)
+    assert stats["edge_prob"][("b", "lb")] == pytest.approx(0.8)
+    assert stats["edge_prob"][("a", "shared")] == pytest.approx(0.5)
+
+
+def test_cifar10_groups_split_vehicles_from_animals():
+    from beamroot.data import CIFAR10_CLASSES, CIFAR10_GROUPS
+    vehicles = {CIFAR10_CLASSES[i] for i, g in CIFAR10_GROUPS.items() if g == "vehicle"}
+    assert vehicles == {"airplane", "automobile", "ship", "truck"}
+    assert sum(g == "animal" for g in CIFAR10_GROUPS.values()) == 6
+    mass = [0.0] * 10
+    mass[0], mass[8], mass[3] = 3.0, 3.0, 2.0  # two vehicle classes, one animal
+    assert purity(mass, CIFAR10_GROUPS) == ("vehicle", pytest.approx(0.75))

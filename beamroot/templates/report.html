@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>beamroot report - {{ run_name }}</title>
+<style>
+body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 2em auto; max-width: 1100px; color: #222; }
+table { border-collapse: collapse; }
+th, td { border: 1px solid #ccc; padding: 4px 10px; text-align: right; }
+th:first-child, td:first-child { text-align: left; }
+img { max-width: 100%; }
+.sample { display: flex; align-items: center; gap: 1em; border-top: 1px solid #ddd; padding: 6px 0; }
+.sample img { width: 84px; image-rendering: pixelated; }
+.sample ol { margin: 0; padding-left: 1.4em; font-family: monospace; font-size: 0.9em; }
+.ok { color: #1a7f37; } .bad { color: #b42318; }
+</style>
+</head>
+<body>
+<h1>{{ run_name }}</h1>
+<p>{{ config.dataset }} / {{ config.model }}, seed {{ config.seed }}, {{ num_nodes }} nodes.</p>
+
+<h2 id="accuracy">Accuracy</h2>
+<table>
+<tr><th>mode</th><th>accuracy</th><th>mean nodes evaluated</th></tr>
+{% for r in rows %}
+<tr><td>{{ r.mode }}</td><td>{{ "%.4f"|format(r.accuracy) }}</td><td>{{ "%.2f"|format(r.mean_nodes) }}</td></tr>
+{% endfor %}
+{% if baseline %}
+<tr><td>baseline ({{ baseline.params }} params)</td><td>{{ "%.4f"|format(baseline.accuracy) }}</td><td>1.00</td></tr>
+{% endif %}
+</table>
+{% if baseline %}<p>Baseline run {{ baseline.name }}; DAG has {{ dag_params }} params.</p>{% endif %}
+
+<h2 id="graph">Router graph</h2>
+<p>Nodes show the dominant {{ purity_label }} and its purity; edges show the mean routing probability.</p>
+<img alt="router graph" src="data:image/png;base64,{{ graph_png }}">
+
+<h2 id="samples">Sample paths (beam {{ beam }})</h2>
+{% for s in samples %}
+<div class="sample">
+<img alt="sample {{ s.index }}" src="data:image/png;base64,{{ s.image }}">
+<div>
+<div>sample {{ s.index }}: true {{ s.label }}, predicted <span class="{{ 'ok' if s.pred == s.label else 'bad' }}">{{ s.pred }}</span></div>
+<ol>
+{% for p in s.paths %}<li>{{ p.nodes|join(" -> ") }} &nbsp; p={{ "%.3f"|format(p.prob) }} &nbsp; class {{ p.pred }}</li>
+{% endfor %}</ol>
+</div>
+</div>
+{% endfor %}
+
+<h2 id="purity">Per-node purity</h2>
+<table>
+<tr><th>node</th><th>kind</th><th>dominant class</th><th>class purity</th>{% if has_groups %}<th>group</th><th>group purity</th>{% endif %}</tr>
+{% for r in purity_rows %}
+<tr><td>{{ r.node }}</td><td>{{ r.kind }}</td><td>{{ r["class"] }}</td><td>{{ "%.1f%%"|format(r.class_purity * 100) }}</td>{% if has_groups %}<td>{{ r.group }}</td><td>{{ "%.1f%%"|format(r.group_purity * 100) }}</td>{% endif %}</tr>
+{% endfor %}
+</table>
+
+<h2 id="histograms">Per-node class histogram</h2>
+<p>Reach-weighted share of each class among the test data reaching the node.</p>
+<img alt="per-node class histograms" src="data:image/png;base64,{{ hist_png }}">
+</body>
+</html>

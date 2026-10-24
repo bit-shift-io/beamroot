@@ -1,4 +1,4 @@
-Status: pending
+Status: done
 Complexity: 3 (design 1, scope 1, tests 1, hazards 0)
 MCP: none
 
