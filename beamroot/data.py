@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Subset, TensorDataset
 
 
 CIFAR10_CLASSES = ["airplane", "automobile", "bird", "cat", "deer",
@@ -27,8 +27,16 @@ def dataset_info(name: str) -> dict:
     return DATASETS[name]
 
 
+def split_indices(n: int, val_size: int, seed: int):
+    """Seeded split of range(n) into (train_idx, val_idx); val_idx has val_size entries."""
+    if not 0 <= val_size <= n:
+        raise ValueError(f"val_size must be in [0, {n}], got {val_size}")
+    perm = torch.randperm(n, generator=torch.Generator().manual_seed(seed)).tolist()
+    return sorted(perm[val_size:]), sorted(perm[:val_size])
+
+
 def synthetic_loaders(batch_size: int, n: int = 256, seed: int = 0,
-                      channels: int = 1, size: int = 28):
+                      channels: int = 1, size: int = 28, val_size: int = 5000):
     """Tiny learnable synthetic dataset (class = which quadrant is bright); no download."""
     g = torch.Generator().manual_seed(seed)
     y = torch.randint(0, 4, (n,), generator=g)
@@ -38,22 +46,27 @@ def synthetic_loaders(batch_size: int, n: int = 256, seed: int = 0,
         r, col = (c // 2) * h, (c % 2) * h
         x[i, :, r:r + h, col:col + h] += 1.0
     ds = TensorDataset(x, y)
+    val_size = min(val_size, n // 8)  # keep most of the tiny set for training
+    train_idx, val_idx = split_indices(n, val_size, seed)
     gen = torch.Generator().manual_seed(seed)
-    return (DataLoader(ds, batch_size=batch_size, shuffle=True, generator=gen),
+    return (DataLoader(Subset(ds, train_idx), batch_size=batch_size, shuffle=True, generator=gen),
+            DataLoader(Subset(ds, val_idx), batch_size=batch_size),
             DataLoader(ds, batch_size=batch_size))
 
 
-def mnist_loaders(batch_size: int, root: str = "data", seed: int = 0):
+def mnist_loaders(batch_size: int, root: str = "data", seed: int = 0, val_size: int = 5000):
     from torchvision import datasets, transforms
     tf = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
     train = datasets.MNIST(root, train=True, download=True, transform=tf)
     test = datasets.MNIST(root, train=False, download=True, transform=tf)
+    train_idx, val_idx = split_indices(len(train), val_size, seed)
     gen = torch.Generator().manual_seed(seed)
-    return (DataLoader(train, batch_size=batch_size, shuffle=True, generator=gen),
+    return (DataLoader(Subset(train, train_idx), batch_size=batch_size, shuffle=True, generator=gen),
+            DataLoader(Subset(train, val_idx), batch_size=512),
             DataLoader(test, batch_size=512))
 
 
-def cifar10_loaders(batch_size: int, root: str = "data", seed: int = 0):
+def cifar10_loaders(batch_size: int, root: str = "data", seed: int = 0, val_size: int = 5000):
     """CIFAR-10; random crop (pad 4) and horizontal flip on the training set only."""
     from torchvision import datasets, transforms
     norm = transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
@@ -62,19 +75,24 @@ def cifar10_loaders(batch_size: int, root: str = "data", seed: int = 0):
                                    transforms.ToTensor(), norm])
     test_tf = transforms.Compose([transforms.ToTensor(), norm])
     train = datasets.CIFAR10(root, train=True, download=True, transform=train_tf)
+    # Val comes from a second, unaugmented copy of the train set, subset by the same indices.
+    val_src = datasets.CIFAR10(root, train=True, download=True, transform=test_tf)
     test = datasets.CIFAR10(root, train=False, download=True, transform=test_tf)
+    train_idx, val_idx = split_indices(len(train), val_size, seed)
     gen = torch.Generator().manual_seed(seed)
-    return (DataLoader(train, batch_size=batch_size, shuffle=True, generator=gen),
+    return (DataLoader(Subset(train, train_idx), batch_size=batch_size, shuffle=True, generator=gen),
+            DataLoader(Subset(val_src, val_idx), batch_size=512),
             DataLoader(test, batch_size=512))
 
 
-def get_loaders(dataset: str, batch_size: int, seed: int = 0):
+def get_loaders(dataset: str, batch_size: int, seed: int = 0, val_size: int = 5000):
+    """Return (train, val, test) loaders; val is held out of train by seed."""
     if dataset == "mnist":
-        return mnist_loaders(batch_size, seed=seed)
+        return mnist_loaders(batch_size, seed=seed, val_size=val_size)
     if dataset == "synthetic":
-        return synthetic_loaders(batch_size, seed=seed)
+        return synthetic_loaders(batch_size, seed=seed, val_size=val_size)
     if dataset == "cifar10":
-        return cifar10_loaders(batch_size, seed=seed)
+        return cifar10_loaders(batch_size, seed=seed, val_size=val_size)
     if dataset == "synthetic_cifar":
-        return synthetic_loaders(batch_size, seed=seed, channels=3, size=32)
+        return synthetic_loaders(batch_size, seed=seed, channels=3, size=32, val_size=val_size)
     raise ValueError(f"unknown dataset {dataset!r}")

@@ -143,3 +143,106 @@ def test_baseline_and_grow_every_zero_do_not_grow(tmp_path):
     assert not (res["run_dir"] / "growth.jsonl").exists()
     res = run(parse_args(base + ["--model", "baseline"]))
     assert not (res["run_dir"] / "growth.jsonl").exists()
+
+
+def test_cli_grows_by_cluster_split_and_has_no_split_init_flag(tmp_path):
+    from beamroot.train import parse_args, run
+    base = ["--dataset", "synthetic", "--model", "dag", "--device", "cpu", "--epochs", "2",
+            "--grow-every", "1", "--max-nodes", "5", "--runs-dir", str(tmp_path)]
+    with pytest.raises(SystemExit):
+        parse_args(base + ["--split-init", "copy"])
+    res = run(parse_args(base + ["--split-noise", "0.01"]))
+    ev = json.loads((res["run_dir"] / "growth.jsonl").read_text().splitlines()[0])
+    assert sum(ev["cluster_sizes"]) > 0 and "fallback" in ev
+
+
+def test_two_means_recovers_two_weighted_clusters():
+    from beamroot.growth import two_means
+    g = torch.Generator().manual_seed(0)
+    a = torch.randn(40, 8, generator=g) * 0.1 + 3.0
+    b = torch.randn(60, 8, generator=g) * 0.1 - 3.0
+    h = torch.cat([a, b])
+    w = torch.rand(100, generator=g) + 0.1
+    labels = two_means(h, w)
+    assert labels.shape == (100,)
+    assert len(set(labels[:40].tolist())) == 1 and len(set(labels[40:].tolist())) == 1
+    assert labels[0] != labels[40]
+
+
+def test_neuron_masks_partition_units_ties_to_first():
+    from beamroot.growth import neuron_masks
+    # unit 0: group 0 fires more; unit 1: group 1 fires more; unit 2: tie; unit 3: tie at 0
+    h = torch.tensor([[2.0, 0.0, 1.0, 0.0],
+                      [2.0, 0.0, 1.0, 0.0],
+                      [0.0, 3.0, 1.0, 0.0]])
+    w = torch.tensor([1.0, 0.5, 1.0])
+    labels = torch.tensor([0, 0, 1])
+    k0, k1 = neuron_masks(h, w, labels)
+    assert k0.tolist() == [True, False, True, True]
+    assert k1.tolist() == [False, True, False, False]
+    assert torch.all(k0 ^ k1)
+
+
+def two_cluster_loader(n=64, batch_size=32):
+    """Images that are bright in the top half or the bottom half; first n/2 top."""
+    from torch.utils.data import DataLoader, TensorDataset
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(n, 1, 28, 28, generator=g) * 0.1
+    x[: n // 2, :, :14] += 1.0
+    x[n // 2:, :, 14:] += 1.0
+    y = torch.randint(0, 10, (n,), generator=g)
+    return DataLoader(TensorDataset(x, y), batch_size=batch_size), x
+
+
+def test_cluster_split_router_sends_each_cluster_to_its_own_leaf():
+    import math
+    from beamroot.growth import cluster_split
+    from beamroot.losses import routing_entropy
+    torch.manual_seed(0)
+    model = DAGRouterModel()
+    loader, x = two_cluster_loader()
+    new, info = cluster_split(model, "leaf0", loader, "cpu")
+    assert model.graph.children("leaf0") == list(new)
+    assert sorted(info["cluster_sizes"]) == [32, 32]
+    assert info["fallback"] is None and info["router_pretrain_loss"] < 0.1
+    model.eval()
+    with torch.no_grad():
+        p = model.route(x)["log_route"]["leaf0"]
+    top, bottom = p[:32].exp().mean(0), p[32:].exp().mean(0)
+    assert top.max() > 0.9 and bottom.max() > 0.9 and top.argmax() != bottom.argmax()
+    assert routing_entropy(p).item() < 0.25 * math.log(2)
+
+
+def test_cluster_split_changes_only_new_nodes_and_leaves_keep_their_units():
+    from beamroot.growth import cluster_split
+    torch.manual_seed(0)
+    model = DAGRouterModel()
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    old_w = model.nodes["leaf0"].net[0].weight.clone()
+    loader, _ = two_cluster_loader()
+    new, _ = cluster_split(model, "leaf0", loader, "cpu", noise=1e-4)
+    after = model.state_dict()
+    for k, v in before.items():
+        if not k.startswith("nodes.leaf0."):
+            assert torch.equal(after[k], v), k
+    near = [(model.nodes[n].net[0].weight - old_w).abs().amax(1) < 1e-2 for n in new]
+    assert torch.all(near[0] ^ near[1])  # each unit kept by exactly one new leaf
+
+
+def test_grow_cluster_logs_sizes_and_loss_and_falls_back_to_copy_when_degenerate(tmp_path):
+    from torch.utils.data import DataLoader, TensorDataset
+    from beamroot.growth import grow
+    torch.manual_seed(0)
+    model = DAGRouterModel()
+    loader, _ = two_cluster_loader()
+    grow(model, loader, "cpu", 1, tmp_path, max_nodes=9)
+    same = DataLoader(TensorDataset(torch.ones(16, 1, 28, 28), torch.zeros(16).long()),
+                      batch_size=8)
+    grow(model, same, "cpu", 2, tmp_path, max_nodes=9)
+    ev1, ev2 = [json.loads(s) for s in (tmp_path / "growth.jsonl").read_text().splitlines()]
+    assert sum(ev1["cluster_sizes"]) == 64
+    assert ev1["fallback"] is None and ev1["router_pretrain_loss"] < 0.1
+    assert ev2["cluster_sizes"] == [16, 0] and ev2["fallback"] == "copy"
+    assert ev2["router_pretrain_loss"] is None
+    a, b = (model.nodes[n].net[0].weight for n in ev2["new_nodes"])
+    assert torch.allclose(a, b, atol=1e-2)  # copy split: both near the old leaf

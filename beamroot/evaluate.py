@@ -69,7 +69,8 @@ def main(argv=None) -> list[dict]:
     args = parse_args(argv)
     device = select_device(args.device)
     model, config = load_run(args.run_dir, device)
-    _, test_loader = get_loaders(config["dataset"], config["batch_size"], config["seed"])
+    _, _, test_loader = get_loaders(config["dataset"], config["batch_size"], config["seed"],
+                                     config.get("val_size", 0))
     rows = evaluate_modes(model, test_loader, device, args.beams, args.limit_batches)
     print(format_table(rows))
     (Path(args.run_dir) / "eval.json").write_text(json.dumps(rows, indent=2))

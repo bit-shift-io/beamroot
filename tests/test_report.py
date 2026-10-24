@@ -50,8 +50,8 @@ def test_train_writes_report_automatically_unless_no_report(tmp_path):
 
 
 def test_baseline_run_skips_report(tmp_path):
-    res = run(parse_args(["--dataset", "synthetic", "--device", "cpu", "--epochs", "1",
-                          "--limit-batches", "1", "--runs-dir", str(tmp_path)]))
+    res = run(parse_args(["--dataset", "synthetic", "--model", "baseline", "--device", "cpu",
+                          "--epochs", "1", "--limit-batches", "1", "--runs-dir", str(tmp_path)]))
     assert not (res["run_dir"] / "report.html").exists()
 
 

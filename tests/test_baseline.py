@@ -10,8 +10,12 @@ def test_forward_shape():
 
 
 def test_training_reduces_loss(tmp_path):
-    args = parse_args(["--dataset", "synthetic", "--device", "cpu", "--epochs", "3",
-                       "--runs-dir", str(tmp_path)])
+    args = parse_args(["--dataset", "synthetic", "--model", "baseline", "--device", "cpu",
+                       "--epochs", "3", "--runs-dir", str(tmp_path)])
     res = run(args)
     assert res["loss"] < res["first_loss"]
     assert res["test_acc"] > 0.9
+
+
+def test_model_defaults_to_dag():
+    assert parse_args(["--dataset", "synthetic"]).model == "dag"

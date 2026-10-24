@@ -1,0 +1,39 @@
+# Experiment log
+
+One file per experiment: `NNNN-short-name.md`, numbered in order. Write it when the runs finish, and fill in the Decision section once one is made. Never delete an entry, even when its idea lost: it records what not to retry.
+
+ADRs record a decision. Entries here record the evidence and what was tried.
+
+## Template
+
+```
+# Experiment NNNN: Title
+
+**Date:** YYYY-MM-DD
+**Status:** pending user review | decided
+
+## Hypothesis
+[What we expected, and why.]
+
+## Variants
+[Bullets: each variant and the flags that select it.]
+
+## Setup
+[Datasets, seeds, epochs, fixed flags, commit hash, results directory.]
+
+## Results
+[Table: mean ± std per variant and dataset. Main criterion first.]
+
+## Per-variant notes
+[For each variant: what it did well, what it did badly, the likely reason.]
+
+## Not tried
+[Ideas considered and left out, with the reason.]
+
+## Decision
+[What was adopted, why the winner won, and the ADR that records it.]
+```
+
+## Index
+
+- [0001: Routing specialisation](0001-routing-specialisation.md): path vs mixture loss × copy/random/cluster split initialisation, with cross-depth merges. Decided: path loss + cluster split ([ADR 0003](../adr/0003-path-loss-and-cluster-splits.md)).

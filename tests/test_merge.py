@@ -202,3 +202,68 @@ def test_report_lists_parents_of_merged_nodes(tmp_path):
     html = (run_dir / "report.html").read_text()
     assert "1 merged node" in html
     assert "<td>la1</td><td>leaf (merged)</td><td>a, b</td>" in html
+
+
+def chain():
+    """Default graph split twice down one side: root -> leaf0, leaf1; leaf1 -> leaf2, leaf3;
+    leaf3 -> leaf4, leaf5. Leaves sit at depths 1, 2, 3, 3."""
+    from beamroot.models.dag import default_graph
+    g = default_graph()
+    assert g.split("leaf1") == ("leaf2", "leaf3")
+    assert g.split("leaf3") == ("leaf4", "leaf5")
+    return g
+
+
+def test_chain_candidates_pair_leaves_across_depths_but_never_siblings_or_ancestors():
+    from beamroot.growth import candidate_pairs
+    pairs = candidate_pairs(chain())
+    assert set(pairs) == {("leaf0", "leaf2"), ("leaf0", "leaf4"), ("leaf0", "leaf5"),
+                          ("leaf2", "leaf4"), ("leaf2", "leaf5")}
+
+
+def test_merging_a_depth_1_leaf_with_a_depth_3_leaf_stays_acyclic_and_keeps_soft_output():
+    from beamroot.analysis import node_depths
+    from beamroot.growth import merge_candidates, merge_nodes
+    torch.manual_seed(0)
+    model = DAGRouterModel(graph=chain()).eval()
+    model.nodes["leaf4"].load_state_dict(model.nodes["leaf0"].state_dict())
+    data = batch()
+    kl = {(k, d): v for v, k, d in merge_candidates(model, data, "cpu")}
+    assert kl[("leaf0", "leaf4")] == pytest.approx(0.0, abs=1e-6)
+    before = model(data[0][0])
+    assert merge_nodes(model, "leaf0", "leaf4") == ["leaf4"]
+    g = model.graph
+    assert sorted(g.topological_order()) == sorted(g.nodes)
+    assert g.parents("leaf0") == ["root", "leaf3"]
+    assert node_depths(g)["leaf0"] == 3
+    assert torch.allclose(model(data[0][0]), before, atol=1e-6)
+
+
+def test_nodes_from_the_latest_split_are_not_candidates():
+    from beamroot.growth import candidate_pairs, merge_candidates
+    assert candidate_pairs(chain(), protected={"leaf4", "leaf5"}) == [("leaf0", "leaf2")]
+    torch.manual_seed(0)
+    model = DAGRouterModel(graph=chain())
+    pairs = {(k, d) for _, k, d in merge_candidates(model, batch(), "cpu",
+                                                     protected={"leaf4", "leaf5"})}
+    assert pairs == {("leaf0", "leaf2")}
+
+
+def test_train_protects_the_previous_splits_new_leaves_at_each_merge_check(tmp_path, monkeypatch):
+    import beamroot.train as train
+    from beamroot.growth import merge_step
+    seen = {}
+
+    def spy(model, loader, device, epoch, run_dir, threshold, **kw):
+        seen[epoch] = set(kw.get("protected", ()))
+        return merge_step(model, loader, device, epoch, run_dir, threshold, **kw)
+
+    monkeypatch.setattr(train, "merge_step", spy)
+    res = train.run(train.parse_args([
+        "--dataset", "synthetic", "--model", "dag", "--device", "cpu", "--epochs", "4",
+        "--max-nodes", "7", "--merge", "--merge-threshold", "1e-12", "--no-report",
+        "--runs-dir", str(tmp_path)]))
+    events = [json.loads(s) for s in (res["run_dir"] / "growth.jsonl").read_text().splitlines()]
+    splits = {e["epoch"]: set(e["new_nodes"]) for e in events if "split" in e}
+    assert sorted(splits) == [1, 2]
+    assert seen == {1: set(), 2: splits[1], 3: splits[2]}

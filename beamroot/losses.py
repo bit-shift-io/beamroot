@@ -27,3 +27,14 @@ def balance_loss(log_reach: dict, log_route: dict) -> torch.Tensor:
 def routing_entropy(log_route: torch.Tensor) -> torch.Tensor:
     """Mean per-sample entropy of a router's child distribution."""
     return -(log_route.exp() * log_route).sum(1).mean()
+
+
+def leaf_path_terms(log_reach: dict, leaf_log_probs: dict, y: torch.Tensor) -> dict:
+    """Per-leaf, per-sample reach(leaf) * NLL(leaf, label), each shape (B,)."""
+    return {n: log_reach[n].exp() * -lp.gather(1, y[:, None]).squeeze(1)
+            for n, lp in leaf_log_probs.items()}
+
+
+def path_loss(log_reach: dict, leaf_log_probs: dict, y: torch.Tensor) -> torch.Tensor:
+    """Mean over samples of the sum over leaves of reach(leaf) * NLL(leaf, label)."""
+    return sum(leaf_path_terms(log_reach, leaf_log_probs, y).values()).mean()

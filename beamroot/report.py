@@ -148,7 +148,8 @@ def render_report(run_dir, device=None, samples=8, beam=3, beams=(1, 3, 5),
     run_dir = Path(run_dir)
     device = select_device(device) if not isinstance(device, torch.device) else device
     model, config = load_run(run_dir, device)
-    _, test_loader = get_loaders(config["dataset"], config["batch_size"], config["seed"])
+    _, _, test_loader = get_loaders(config["dataset"], config["batch_size"], config["seed"],
+                                     config.get("val_size", 0))
     graph = model.graph
     if groups is None:
         groups = dataset_info(config["dataset"])["groups"]

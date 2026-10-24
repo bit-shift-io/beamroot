@@ -11,3 +11,11 @@
 - **Merge** — Joining two behaviourally near-identical nodes into one that keeps both sets of parents.
 - **Load-balancing loss** — Penalty pushing each router to use its children evenly across a batch.
 - **Purity** — Share of the data reaching a node that belongs to its most common class or class group.
+- **Soft prediction** — Answer from running every node and mixing all leaves by reach. Reported as soft accuracy; not a training target.
+- **Beam 1** — Beam with N = 1: one path, one leaf, one answer. The explainable, cheap mode, and the main measure of a model.
+- **Mixture loss** — Historical (removed, ADR 0003): cross-entropy of the soft prediction. Leaves were only judged as a blend, never alone.
+- **Path loss** — Reach-weighted mean of each leaf's own cross-entropy. Every leaf must be right on the images it receives. What DAG training optimises (ADR 0003).
+- **Split initialisation** — How a split's two new leaves and router start. Always `cluster`: seeded from two groups of the leaf's images, router pre-trained on the groups; `copy` (old leaf plus noise) only as the fallback when a group is empty. `random` and `copy` as modes are historical (ADR 0003).
+- **Routing entropy** — Mean per-image entropy of a router's child probabilities. ln 2 for two children means undecided; near 0 means decisive. Not the same as usage balance.
+- **Validation set** — Training images held out by seed for structural decisions such as merges. The test set is for reporting only.
+- **Experiment log** — `docs/experiments/`: one permanent entry per experiment with variants, results, and the decision.

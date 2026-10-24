@@ -85,3 +85,19 @@ def test_cifar10_groups_split_vehicles_from_animals():
     mass = [0.0] * 10
     mass[0], mass[8], mass[3] = 3.0, 3.0, 2.0  # two vehicle classes, one animal
     assert purity(mass, CIFAR10_GROUPS) == ("vehicle", pytest.approx(0.75))
+
+
+def test_collect_stats_router_entropy_is_mean_per_image_entropy():
+    import math
+    model = DAGRouterModel(graph=diamond()).eval()
+    force(model, "root", [0.75, 0.25])
+    force(model, "a", [0.5, 0.5])
+    force(model, "b", [0.2, 0.8])
+    batches = [(torch.randn(3, 1, 28, 28), torch.tensor([0, 1, 2])),
+               (torch.randn(1, 1, 28, 28), torch.tensor([3]))]
+    ent = collect_stats(model, batches, "cpu", num_classes=10)["entropy"]
+    h = lambda ps: -sum(p * math.log(p) for p in ps)  # noqa: E731
+    assert set(ent) == {"root", "a", "b"}
+    assert ent["root"] == pytest.approx(h([0.75, 0.25]))
+    assert ent["a"] == pytest.approx(math.log(2))
+    assert ent["b"] == pytest.approx(h([0.2, 0.8]))

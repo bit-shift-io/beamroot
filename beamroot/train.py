@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from beamroot.data import dataset_info, get_loaders
 from beamroot.device import select_device
 from beamroot.growth import grow, merge_step, rebuild_optimizer, save_graph_snapshot
-from beamroot.losses import balance_loss, router_usage, routing_entropy
+from beamroot.losses import balance_loss, path_loss, router_usage, routing_entropy
 from beamroot.models.baseline import BaselineCNN, count_params, match_width
 from beamroot.models.dag import DAGRouterModel
 from beamroot.runs import create_run_dir, log_metrics
@@ -26,22 +26,30 @@ def evaluate(model, loader, device, limit_batches=None):
     return correct / max(total, 1)
 
 
-def train_epoch(model, loader, opt, device, limit_batches=None, balance_weight=0.0, stats=None):
+def train_epoch(model, loader, opt, device, limit_batches=None, balance_weight=0.0, stats=None,
+                parts=None):
     """Returns the list of per-step losses (cross-entropy + weighted balance loss).
 
-    For DAG models, `stats` (a dict) is filled with per-router mean usage and entropy.
+    DAG models train on the path loss (ADR 0003); baselines on plain cross-entropy.
+    For DAG models, `stats` (a dict) is filled with per-router mean usage and entropy,
+    and `parts` (a dict) with the mean "ce" (path loss) and "balance" components of the loss.
     """
     model.train()
     losses = []
     sums, steps = {}, 0
+    ce_sum = bal_sum = 0.0
     for x, y in islice(loader, limit_batches):
         opt.zero_grad()
         y = y.to(device)
         if isinstance(model, DAGRouterModel):
             out = model.route(x.to(device))
-            loss = F.cross_entropy(out["log_probs"], y)
+            ce = path_loss(out["log_reach"], out["leaf_log_probs"], y)
+            loss, bal = ce, 0.0
             if balance_weight:
-                loss = loss + balance_weight * balance_loss(out["log_reach"], out["log_route"])
+                bal = balance_weight * balance_loss(out["log_reach"], out["log_route"])
+                loss = ce + bal
+            ce_sum += ce.item()
+            bal_sum += float(bal)
             with torch.no_grad():
                 for name, lr in out["log_route"].items():
                     u = router_usage(out["log_reach"][name], lr).cpu()
@@ -57,6 +65,8 @@ def train_epoch(model, loader, opt, device, limit_batches=None, balance_weight=0
     if stats is not None:
         for name, (u, e) in sums.items():
             stats[name] = {"usage": (u / steps).tolist(), "entropy": float(e / steps)}
+    if parts is not None and steps:
+        parts.update({"ce": ce_sum / steps, "balance": bal_sum / steps})
     return losses
 
 
@@ -91,7 +101,10 @@ def save_payload(model):
 def run(args) -> dict:
     torch.manual_seed(args.seed)
     device = select_device(args.device)
-    train_loader, test_loader = get_loaders(args.dataset, args.batch_size, args.seed)
+    if args.merge and args.val_size == 0:
+        raise SystemExit("--merge needs a validation set; use --val-size > 0")
+    train_loader, val_loader, test_loader = get_loaders(
+        args.dataset, args.batch_size, args.seed, args.val_size)
     if args.epochs is None:
         args.epochs = dataset_info(args.dataset)["epochs"]
     if args.match_params:
@@ -106,16 +119,19 @@ def run(args) -> dict:
     if growing:
         save_graph_snapshot(model, run_dir, 0)
     first_loss, last = None, {}
+    fresh = []  # the latest split's new leaves; never merge candidates
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        stats = {}
+        stats, parts = {}, {}
         losses = train_epoch(model, train_loader, opt, device, args.limit_batches,
-                             args.balance_weight, stats)
+                             args.balance_weight, stats, parts)
         if first_loss is None:
             first_loss = losses[0]
         acc = evaluate(model, test_loader, device, args.limit_batches)
         last = {"epoch": epoch, "loss": sum(losses) / len(losses),
                 "test_acc": acc, "seconds": time.time() - t0}
+        if parts:
+            last["ce_loss"], last["balance_loss"] = parts["ce"], parts["balance"]
         if stats:
             last["routing"] = stats
         if isinstance(model, DAGRouterModel):
@@ -129,20 +145,26 @@ def run(args) -> dict:
         if growing and epoch % args.grow_every == 0 and epoch < args.epochs:
             merges = []
             if args.merge:  # merge first so freed nodes count towards the split budget
-                merges = merge_step(model, test_loader, device, epoch, run_dir,
-                                    args.merge_threshold, limit_batches=args.growth_batches)
+                merges = merge_step(model, val_loader, device, epoch, run_dir,
+                                    args.merge_threshold, limit_batches=args.growth_batches,
+                                    protected=set(fresh))
                 for m in merges:
                     print(f"  merge {m['merge'][1]} into {m['merge'][0]} (sym KL {m['kl']:.4f}), "
                           f"removed {m['removed']} ({m['num_nodes']} nodes)", flush=True)
                 if not merges:
                     print(f"  merge: no pair below sym KL {args.merge_threshold}", flush=True)
             event = grow(model, train_loader, device, epoch, run_dir, args.max_nodes,
-                         limit_batches=args.growth_batches)
+                         limit_batches=args.growth_batches, noise=args.split_noise)
+            fresh = event["new_nodes"] if event else []
             if event or merges:
                 opt = rebuild_optimizer(model, opt)
             if event:
                 print(f"  split {event['split']} -> {event['new_nodes']} "
                       f"({event['num_nodes']} nodes)", flush=True)
+                if "cluster_sizes" in event:
+                    print(f"  cluster sizes {event['cluster_sizes']} router pre-train loss "
+                          f"{event['router_pretrain_loss']} fallback {event['fallback']}",
+                          flush=True)
     torch.save(save_payload(model), run_dir / "model.pt")
     if growing:  # growth changes the size; config.json records the final count
         config["params"] = count_params(model)
@@ -157,7 +179,7 @@ def run(args) -> dict:
 def parse_args(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", default="mnist", choices=["mnist", "synthetic", "cifar10", "synthetic_cifar"])
-    p.add_argument("--model", default="baseline", choices=["baseline", "dag"])
+    p.add_argument("--model", default="dag", choices=["dag", "baseline"])
     p.add_argument("--device", default=None, help="mps or cpu (default: mps if available)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--epochs", type=int, default=None, help="default depends on the dataset")
@@ -165,6 +187,8 @@ def parse_args(argv=None):
     p.add_argument("--hidden", type=int, default=None, help="baseline head hidden size (default 128)")
     p.add_argument("--match-params", default=None, metavar="RUN_DIR",
                    help="baseline only: size the CNN within 10%% of this DAG run's parameter count")
+    p.add_argument("--val-size", type=int, default=5000,
+                   help="training images held out (by --seed) as the validation set for merges")
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--balance-weight", type=float, default=0.1,
@@ -174,9 +198,13 @@ def parse_args(argv=None):
     p.add_argument("--max-nodes", type=int, default=7,
                    help="dag only: stop growing when a split would exceed this many graph nodes")
     p.add_argument("--growth-batches", type=int, default=50,
-                   help="training batches used to measure per-leaf loss before a split")
+                   help="training batches used to measure per-leaf loss and to cluster "
+                        "the chosen leaf's images before a split")
+    p.add_argument("--split-noise", type=float, default=1e-3,
+                   help="std of the noise added to the kept units of a split's new leaves "
+                        "(and to both copies when a split falls back to copy)")
     p.add_argument("--merge", action="store_true",
-                   help="dag only: at each growth step, first merge same-depth node pairs whose "
+                   help="dag only: at each growth step, first merge node pairs whose "
                         "outputs on held-out data are near-identical")
     p.add_argument("--merge-threshold", type=float, default=0.05,
                    help="merge pairs whose mean symmetric KL is below this (nats)")

@@ -38,7 +38,8 @@ def main(argv=None) -> list[tuple[int, BeamResult]]:
     args = parse_args(argv)
     device = select_device(args.device)
     model, config = load_run(args.run_dir, device)
-    _, test_loader = get_loaders(config["dataset"], config["batch_size"], config["seed"])
+    _, _, test_loader = get_loaders(config["dataset"], config["batch_size"], config["seed"],
+                                     config.get("val_size", 0))
     xs, ys = [], []
     for x, y in test_loader:
         xs.append(x)
