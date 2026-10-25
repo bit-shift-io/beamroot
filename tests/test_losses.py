@@ -106,3 +106,36 @@ def test_cli_has_no_loss_flag():
     import pytest
     with pytest.raises(SystemExit):
         parse_args(["--model", "dag", "--loss", "path"])
+
+
+def test_balance_is_zero_at_the_target_and_positive_elsewhere():
+    lr, lrt = _route([[0.75, 0.25]] * 4)
+    assert abs(balance_loss(lr, lrt, {"r": [0.75, 0.25]}).item()) < 1e-6
+    assert balance_loss(lr, lrt, {"r": [0.5, 0.5]}).item() > 1e-3
+    lr, lrt = _route([[0.5, 0.5]] * 4)
+    assert balance_loss(lr, lrt, {"r": [0.75, 0.25]}).item() > 1e-3
+
+
+def test_uniform_target_matches_no_target_and_zero_share_stays_finite():
+    lr, lrt = _route([[0.9, 0.1]] * 4)
+    assert abs(balance_loss(lr, lrt, {"r": [0.5, 0.5]}).item() - balance_loss(lr, lrt).item()) < 1e-6
+    assert math.isfinite(balance_loss(lr, lrt, {"r": [0.0, 1.0]}).item())
+
+
+def test_dag_training_balances_towards_the_graph_targets():
+    from beamroot.models.dag import DAGRouterModel
+    from beamroot.train import train_epoch
+    torch.manual_seed(0)
+    model = DAGRouterModel()
+    model.graph.targets["root"] = [0.9, 0.1]
+    x, y = torch.randn(8, 1, 28, 28), torch.randint(0, 10, (8,))
+    model.train()
+    torch.manual_seed(1)
+    with torch.no_grad():
+        out = model.route(x)
+        expected = balance_loss(out["log_reach"], out["log_route"], {"root": [0.9, 0.1]}).item()
+    parts = {}
+    torch.manual_seed(1)
+    train_epoch(model, [(x, y)], torch.optim.SGD(model.parameters(), lr=0.0), "cpu",
+                balance_weight=1.0, parts=parts)
+    assert abs(parts["balance"] - expected) < 1e-6

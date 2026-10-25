@@ -55,51 +55,137 @@ def split_leaf(model, name: str, noise: float = 1e-3) -> tuple[str, str]:
     return new
 
 
-def two_means(h: torch.Tensor, w: torch.Tensor, iters: int = 25) -> torch.Tensor:
-    """Reach-weighted 2-means on rows of `h` (N, D) with weights `w` (N,); labels (N,) in {0, 1}.
+K_MARGIN = 0.05  # a larger k must beat k = 2's silhouette by this much to be picked
+SILHOUETTE_MAX_POINTS = 8000  # silhouette is O(N^2); evenly subsample beyond this
 
-    Deterministic start: the heaviest point, then the point maximising weight * squared
-    distance from it. Ties in assignment go to cluster 0, so identical rows all land there.
+
+def k_means(h: torch.Tensor, w: torch.Tensor, k: int = 2, iters: int = 25) -> torch.Tensor:
+    """Reach-weighted k-means on rows of `h` (N, D) with weights `w` (N,); labels (N,) in 0..k-1.
+
+    Deterministic start (farthest-point picks): the heaviest point, then repeatedly the
+    point maximising weight * squared distance to its nearest chosen centre. Ties in
+    assignment go to the lowest cluster, so identical rows all land in cluster 0.
     """
-    c0 = h[w.argmax()]
-    c1 = h[(w * ((h - c0) ** 2).sum(1)).argmax()]
-    centres = torch.stack([c0, c1])
+    centres = [h[w.argmax()]]
+    for _ in range(k - 1):
+        d2 = torch.cdist(h, torch.stack(centres)).pow(2).amin(1)
+        centres.append(h[(w * d2).argmax()])
+    centres = torch.stack(centres)
     for _ in range(iters):
         labels = torch.cdist(h, centres).argmin(1)
-        for k in range(2):
-            mask = (labels == k).float() * w
+        for c in range(k):
+            mask = (labels == c).float() * w
             if mask.sum() > 0:
-                centres[k] = (mask[:, None] * h).sum(0) / mask.sum()
+                centres[c] = (mask[:, None] * h).sum(0) / mask.sum()
     return torch.cdist(h, centres).argmin(1)
 
 
-def neuron_masks(h: torch.Tensor, w: torch.Tensor,
-                 labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Which hidden units each group keeps: the group whose reach-weighted mean
-    activation is higher. Every unit goes to exactly one group; ties go to group 0."""
+def silhouette(h: torch.Tensor, w: torch.Tensor, labels: torch.Tensor) -> float:
+    """Reach-weighted mean silhouette of a clustering (in [-1, 1]; higher is better separated).
+
+    Point i's a is its weighted mean distance to the rest of its own cluster, b the
+    lowest weighted mean distance to another non-empty cluster; s = (b - a) / max(a, b),
+    0 for a point alone in its cluster. Computed in float32.
+    """
+    if len(h) > SILHOUETTE_MAX_POINTS:
+        idx = torch.linspace(0, len(h) - 1, SILHOUETTE_MAX_POINTS).long().to(h.device)
+        h, w, labels = h[idx], w[idx], labels[idx]
+    h, w = h.float(), w.float()
+    k = int(labels.max()) + 1
+    onehot = torch.nn.functional.one_hot(labels, k).float() * w[:, None]  # (N, k)
+    sums = torch.cdist(h, h) @ onehot  # weighted distance sums to each cluster
+    mass = onehot.sum(0)  # (k,)
+    own = mass[labels] - w
+    a = sums.gather(1, labels[:, None]).squeeze(1) / own.clamp(min=1e-12)
+    other = sums / mass.clamp(min=1e-12)
+    other[torch.arange(len(h)), labels] = float("inf")
+    other[:, mass == 0] = float("inf")
+    b = other.amin(1)
+    s = (b - a) / torch.maximum(a, b).clamp(min=1e-12)
+    s = torch.where(own > 1e-12, s, torch.zeros_like(s))
+    return float((w * s).sum() / w.sum().clamp(min=1e-12))
+
+
+def pick_k(h: torch.Tensor, w: torch.Tensor, max_k: int = 2):
+    """Cluster for k = 2..max_k and pick k by reach-weighted silhouette.
+
+    Keeps k = 2 unless a larger k with no empty group beats its silhouette by more
+    than `K_MARGIN`. Returns (k, labels for that k, {k: silhouette}).
+    """
+    labels, scores = {}, {}
+    for k in range(2, max_k + 1):
+        labels[k] = k_means(h, w, k)
+        scores[k] = silhouette(h, w, labels[k])
+    full = [k for k in labels if len(set(labels[k].tolist())) == k]
+    best = max(full, key=scores.get, default=2)
+    k = best if best != 2 and scores[best] > scores[2] + K_MARGIN else 2
+    return k, labels[k], scores
+
+
+def neuron_masks(h: torch.Tensor, w: torch.Tensor, labels: torch.Tensor,
+                 k: int = 2) -> list[torch.Tensor]:
+    """Which hidden units each of the `k` groups keeps: the group whose reach-weighted
+    mean activation is highest. Every unit goes to exactly one group; ties go to the
+    lowest group."""
     means = []
-    for k in range(2):
-        wk = (labels == k).float() * w
-        means.append((wk[:, None] * h).sum(0) / wk.sum().clamp(min=1e-12))
-    keep0 = means[0] >= means[1]
-    return keep0, ~keep0
+    for c in range(k):
+        wc = (labels == c).float() * w
+        means.append((wc[:, None] * h).sum(0) / wc.sum().clamp(min=1e-12))
+    best, top = torch.zeros_like(means[0], dtype=torch.long), means[0]
+    for c in range(1, k):
+        wins = means[c] > top
+        best, top = torch.where(wins, c, best), torch.where(wins, means[c], top)
+    return [best == c for c in range(k)]
+
+
+CLASS_MIN_SHARE = 0.1  # class split policy: a class needs this share of the leaf's reach
+
+
+def class_groups(y: torch.Tensor, w: torch.Tensor, max_k: int = 2):
+    """Group a leaf's images by label for the class split policy.
+
+    Each class with at least `CLASS_MIN_SHARE` of the reach-weighted mass `w` gets its
+    own group; the other classes share one. With more than `max_k` groups the smallest
+    qualifying classes are folded into the shared group. Returns
+    (classes per group, group index per image), qualifying classes first in class order
+    and the shared group last; or None if no class qualifies or fewer than two groups
+    would result (the caller falls back to the cluster policy).
+    """
+    present = sorted(set(y.tolist()))
+    total = w.sum().clamp(min=1e-12)
+    mass = {c: float(w[y == c].sum() / total) for c in present}
+    own = [c for c in present if mass[c] >= CLASS_MIN_SHARE]
+    if not own:
+        return None
+    if len(own) + (len(own) < len(present)) > max_k:
+        own = sorted(sorted(own, key=lambda c: -mass[c])[:max_k - 1])
+    rest = [c for c in present if c not in own]
+    groups = [[c] for c in own] + ([rest] if rest else [])
+    if len(groups) < 2:
+        return None
+    labels = torch.empty_like(y)
+    for i, g in enumerate(groups):
+        for c in g:  # no torch.isin: not implemented on MPS
+            labels[y == c] = i
+    return groups, labels
 
 
 def _leaf_inputs(model, name, loader, device, limit_batches):
-    """(stem features, hidden activations of leaf `name`, reach of `name`) over the
-    loader's batches, in eval mode (no dropout) and without gradients."""
+    """(stem features, hidden activations of leaf `name`, reach of `name`, labels) over
+    the loader's batches, in eval mode (no dropout) and without gradients."""
     was_training = model.training
     model.eval()
-    feats, hidden, reach = [], [], []
+    feats, hidden, reach, ys = [], [], [], []
     with torch.no_grad():
-        for x, _ in islice(loader, limit_batches):
+        for x, y in islice(loader, limit_batches):
+            ys.append(y.to(device))
             x = x.to(device)
             f = model.stem(x).flatten(1)
             feats.append(f)
             hidden.append(model.nodes[name].net[:2](f))  # output of the ReLU
             reach.append(model.route(x)["log_reach"][name].exp())
     model.train(was_training)
-    return torch.cat(feats), torch.cat(hidden), torch.cat(reach)
+    return torch.cat(feats), torch.cat(hidden), torch.cat(reach), torch.cat(ys)
 
 
 def _masked_leaf(old, fresh, keep: torch.Tensor, noise: float):
@@ -136,33 +222,53 @@ def _pretrain_router(router, feats, labels, w, steps: int, lr: float) -> float:
 
 def cluster_split(model, name: str, loader, device, noise: float = 1e-3,
                   limit_batches=None, pretrain_steps: int = 100,
-                  pretrain_lr: float = 1e-2) -> tuple[tuple[str, str], dict]:
+                  pretrain_lr: float = 1e-2, max_k: int = 2,
+                  policy: str = "cluster") -> tuple[tuple[str, ...], dict]:
     """Split leaf `name` with cluster initialisation (see CONTEXT.md: Split initialisation).
 
-    The leaf's images (the loader's first `limit_batches` batches) are split in two by
-    reach-weighted 2-means on its hidden activations. New leaf i copies the old leaf,
-    keeps (plus `noise`) the hidden units group i activates more, and re-initialises
-    the rest. The new router is pre-trained on the group labels. If one group is
-    empty, falls back to a `copy` split. Returns (new leaves, info for growth.jsonl).
+    The leaf's images (the loader's first `limit_batches` batches) are split into k
+    groups by reach-weighted k-means on its hidden activations, k in 2..`max_k` picked
+    by silhouette (see `pick_k`). New leaf i copies the old leaf, keeps (plus `noise`)
+    the hidden units group i activates most, and re-initialises the rest. The new
+    k-output router is pre-trained on the group labels, and its balance target is the
+    groups' reach shares. If a group is empty, falls back to a 2-way `copy` split
+    with no target (uniform). Returns (new leaves, info for growth.jsonl).
+
+    With `policy="class"` the groups come from `class_groups` instead of k-means
+    (k = the number of groups, info gains `groups`); if no class qualifies it falls
+    back to the cluster policy and records `policy_fallback`.
     """
-    feats, hidden, reach = _leaf_inputs(model, name, loader, device, limit_batches)
-    labels = two_means(hidden, reach)
-    sizes = [int((labels == k).sum()) for k in range(2)]
+    feats, hidden, reach, ys = _leaf_inputs(model, name, loader, device, limit_batches)
+    grouped = class_groups(ys, reach, max_k) if policy == "class" else None
+    extra = {"policy": policy}
+    if grouped:
+        groups, labels = grouped
+        k, scores = len(groups), {}
+        extra["groups"] = groups
+    else:
+        if policy == "class":
+            extra = {"policy": "cluster", "policy_fallback": "no class >= 10% of reach"}
+        k, labels, scores = pick_k(hidden, reach, max_k)
+    sizes = [int((labels == c).sum()) for c in range(k)]
     info = {"cluster_sizes": sizes,
-            "cluster_reach": [float(reach[labels == k].sum()) for k in range(2)],
-            "router_pretrain_loss": None, "fallback": None}
+            "cluster_reach": [float(reach[labels == c].sum()) for c in range(k)],
+            "router_pretrain_loss": None, "fallback": None,
+            "k": k, "silhouettes": {str(c): v for c, v in scores.items()}, **extra}
     if min(sizes) == 0:
         info["fallback"] = "copy"
         return split_leaf(model, name, noise), info
     old = model.nodes[name]
-    masks = neuron_masks(hidden, reach, labels)
-    new = model.graph.split(name)
+    masks = neuron_masks(hidden, reach, labels, k)
+    new = model.graph.split(name, k)
     model.nodes[name] = model.build_node(name).to(feats.device)
     for n, keep in zip(new, masks):
         fresh = model.build_node(n).to(feats.device)
         model.nodes[n] = _masked_leaf(old, fresh, keep, noise)
     info["router_pretrain_loss"] = _pretrain_router(
         model.nodes[name], feats, labels, reach, pretrain_steps, pretrain_lr)
+    total = sum(info["cluster_reach"])
+    if total > 0:
+        model.graph.targets[name] = [r / total for r in info["cluster_reach"]]
     return new, info
 
 
@@ -295,20 +401,24 @@ def save_graph_snapshot(model, run_dir, epoch: int) -> Path:
 
 
 def grow(model, loader, device, epoch: int, run_dir, max_nodes: int,
-         limit_batches=None, noise: float = 1e-3) -> dict | None:
+         limit_batches=None, noise: float = 1e-3, max_k: int = 2,
+         policy: str = "cluster") -> dict | None:
     """One growth step: cluster-split the leaf with the highest reach-weighted loss
     (ADR 0003), clustering the same batches the loss is measured on.
 
-    Does nothing (returns None) if a split would exceed `max_nodes` graph nodes.
-    Otherwise appends the event (with cluster sizes, router pre-train loss and any
-    fallback) to <run_dir>/growth.jsonl, writes a graph snapshot to
+    The split is k-way for k up to `max_k` and up to what fits in `max_nodes` graph
+    nodes; does nothing (returns None) if even a 2-way split would exceed it.
+    Otherwise appends the event (with k, silhouettes, cluster sizes, router pre-train
+    loss and any fallback) to <run_dir>/growth.jsonl, writes a graph snapshot to
     <run_dir>/graphs/epoch_NNN.json, and returns the event.
     """
-    if len(model.graph.nodes) + 2 > max_nodes:
+    room = min(max_k, max_nodes - len(model.graph.nodes))
+    if room < 2:
         return None
     losses = leaf_losses(model, loader, device, limit_batches)
     target = choose_leaf(losses)
-    new, info = cluster_split(model, target, loader, device, noise, limit_batches)
+    new, info = cluster_split(model, target, loader, device, noise, limit_batches,
+                             max_k=room, policy=policy)
     event = {"epoch": epoch, "split": target, "new_nodes": list(new),
              "num_nodes": len(model.graph.nodes), "leaf_losses": losses, **info}
     with open(Path(run_dir) / "growth.jsonl", "a") as f:

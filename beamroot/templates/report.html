@@ -34,6 +34,8 @@ img { max-width: 100%; }
 <h2 id="graph">Router graph</h2>
 <p>Nodes show the dominant {{ purity_label }} and its purity; edges show the mean routing probability.
 Merged nodes (more than one parent) are orange with a thick border and list their parents.</p>
+<h3>Class flow</h3>
+<pre id="flow">{{ flow }}</pre>
 <img alt="router graph" src="data:image/png;base64,{{ graph_png }}">
 
 <h2 id="samples">Sample paths (beam {{ beam }})</h2>

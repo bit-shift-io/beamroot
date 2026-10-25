@@ -42,6 +42,8 @@ def test_report_cli_writes_graph_png_and_self_contained_html(tmp_path):
     srcs = re.findall(r'src="([^"]*)"', html)
     assert srcs and all(s.startswith("data:image/png;base64,") for s in srcs)
     assert "http" not in html
+    assert (run_dir / "flow.txt").read_text().startswith("root  reach 100%")
+    assert "root  reach 100%" in html
 
 
 def test_train_writes_report_automatically_unless_no_report(tmp_path):

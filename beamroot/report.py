@@ -19,7 +19,7 @@ import networkx as nx  # noqa: E402
 import torch  # noqa: E402
 from jinja2 import Environment, FileSystemLoader, select_autoescape  # noqa: E402
 
-from beamroot.analysis import collect_stats, node_depths, purity  # noqa: E402
+from beamroot.analysis import class_flow, collect_stats, node_depths, purity  # noqa: E402
 from beamroot.beam import beam_search  # noqa: E402
 from beamroot.data import dataset_info, get_loaders  # noqa: E402
 from beamroot.device import select_device  # noqa: E402
@@ -166,6 +166,8 @@ def render_report(run_dir, device=None, samples=8, beam=3, beams=(1, 3, 5),
                     "group": purity(stats["class_mass"][n], groups)[0] if groups else None,
                     "group_purity": purity(stats["class_mass"][n], groups)[1]}
                    for n in graph.topological_order()]
+    flow = class_flow(graph, stats["class_mass"], dataset_info(config["dataset"]).get("classes"))
+    (run_dir / "flow.txt").write_text(flow + "\n")
     baseline_ctx = baseline_summary(baseline) if baseline else None
     graph_png = draw_graph(graph, stats["edge_prob"], labels, run_dir / "graph.png")
     hist_png = draw_histograms(graph, stats["class_mass"])
@@ -185,7 +187,7 @@ def render_report(run_dir, device=None, samples=8, beam=3, beams=(1, 3, 5),
     html = env.get_template("report.html").render(
         run_name=run_dir.name, config=config, num_nodes=len(graph.nodes), rows=rows,
         num_merged=sum(r["merged"] for r in purity_rows),
-        graph_png=_b64(graph_png), hist_png=_b64(hist_png), samples=sample_ctx, beam=beam,
+        flow=flow, graph_png=_b64(graph_png), hist_png=_b64(hist_png), samples=sample_ctx, beam=beam,
         purity_label=purity_label, purity_rows=purity_rows, has_groups=groups is not None,
         baseline=baseline_ctx, dag_params=config.get("params"))
     report = run_dir / "report.html"

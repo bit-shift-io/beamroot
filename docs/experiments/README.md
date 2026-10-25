@@ -37,3 +37,4 @@ ADRs record a decision. Entries here record the evidence and what was tried.
 ## Index
 
 - [0001: Routing specialisation](0001-routing-specialisation.md): path vs mixture loss × copy/random/cluster split initialisation, with cross-depth merges. Decided: path loss + cluster split ([ADR 0003](../adr/0003-path-loss-and-cluster-splits.md)).
+- [0002: K-way splits](0002-kway-splits.md): binary vs k-way cluster vs k-way class split policies at 19 nodes. Decided: `--preset {explainable,pure}`, default `explainable` = `--max-k 4 --split-policy cluster` ([ADR 0004](../adr/0004-growth-presets.md)).

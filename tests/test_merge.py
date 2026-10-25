@@ -261,7 +261,7 @@ def test_train_protects_the_previous_splits_new_leaves_at_each_merge_check(tmp_p
     monkeypatch.setattr(train, "merge_step", spy)
     res = train.run(train.parse_args([
         "--dataset", "synthetic", "--model", "dag", "--device", "cpu", "--epochs", "4",
-        "--max-nodes", "7", "--merge", "--merge-threshold", "1e-12", "--no-report",
+        "--max-nodes", "7", "--max-k", "2", "--merge", "--merge-threshold", "1e-12", "--no-report",
         "--runs-dir", str(tmp_path)]))
     events = [json.loads(s) for s in (res["run_dir"] / "growth.jsonl").read_text().splitlines()]
     splits = {e["epoch"]: set(e["new_nodes"]) for e in events if "split" in e}

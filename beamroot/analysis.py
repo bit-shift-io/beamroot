@@ -68,3 +68,53 @@ def collect_stats(model, loader, device, num_classes, limit_batches=None) -> dic
             "edge_prob": {e: edge_num[e] / edge_den[e] if edge_den[e] > 0 else 0.0
                           for e in edge_num},
             "entropy": {r: e / count for r, e in ent_sum.items()}}
+
+
+def class_flow(graph, class_mass, class_names=None) -> str:
+    """Text tree of which classes reach each node, with reach (node mass / root mass).
+
+    Routers list classes with >= 10% of that class's root mass reaching them; leaves list
+    classes with >= 5% of their own mass and are marked pure at >= 95%. A node met under a
+    second parent prints one "(shared, see above)" line and no subtree.
+    """
+    root = graph.topological_order()[0]
+    name = (lambda c: str(class_names[c])) if class_names else str
+    root_mass = [float(m) for m in class_mass[root]]
+    root_total = sum(root_mass)
+
+    def describe(n):
+        mass = [float(m) for m in class_mass[n]]
+        total = sum(mass)
+        reach = total / root_total if root_total > 0 else 0.0
+        head = f"{n}  reach {reach * 100:.0f}%"
+        if n == root:
+            return f"{head}  {{all classes}}"
+        if graph.nodes[n].kind == "router":
+            share = {c: m / root_mass[c] for c, m in enumerate(mass) if root_mass[c] > 0}
+            kept = sorted((c for c, s in share.items() if s >= 0.1 - 1e-12),
+                          key=lambda c: -share[c])
+            return f"{head}  {{{','.join(name(c) for c in kept)}}}"
+        if total <= 0:
+            return head
+        parts = [f"{name(c)} ({m / total * 100:.0f}%)"
+                 for c, m in sorted(enumerate(mass), key=lambda cm: -cm[1])
+                 if m / total >= 0.05 - 1e-12]
+        pure = "  ← pure" if max(mass) / total >= 0.95 - 1e-12 else ""
+        return f"{head}  {', '.join(parts)}{pure}"
+
+    lines, seen = [describe(root)], {root}
+
+    def walk(n, prefix):
+        kids = graph.children(n)
+        for i, c in enumerate(kids):
+            last = i == len(kids) - 1
+            branch, pad = ("└─ ", "   ") if last else ("├─ ", "│  ")
+            if c in seen:
+                lines.append(f"{prefix}{branch}→ {c}  (shared, see above)")
+                continue
+            seen.add(c)
+            lines.append(f"{prefix}{branch}{describe(c)}")
+            walk(c, prefix + pad)
+
+    walk(root, "")
+    return "\n".join(lines)

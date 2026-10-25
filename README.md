@@ -41,6 +41,9 @@ Flags (defaults in brackets; the dataset defaults are in `beamroot/data.py`):
 - `--balance-weight BALANCE_WEIGHT` load-balancing loss weight, dag only (0 disables) [0.1]
 - `--grow-every GROW_EVERY` dag only: split the worst leaf every K epochs (0 disables) [1]
 - `--max-nodes MAX_NODES` dag only: stop growing when a split would exceed this many graph nodes [7]
+- `--preset {explainable,pure}` dag only: growth defaults for `--max-k` and `--split-policy` [explainable]. `explainable` (unsupervised) = `--max-k 4 --split-policy cluster`; `pure` (supervised, uses labels) = `--max-k 4 --split-policy class`. An explicit `--max-k` or `--split-policy` overrides the preset; `--max-k 2` gives binary splits. Chosen in [experiment 0002](docs/experiments/0002-kway-splits.md), [ADR 0004](docs/adr/0004-growth-presets.md)
+- `--max-k MAX_K` dag only: a split may make up to this many new leaves. It clusters the leaf's activations for k = 2…MAX_K and keeps 2 unless a larger k has a clearly higher silhouette (by more than 0.05). k is capped by what fits under `--max-nodes`; `growth.jsonl` records `k` and `silhouettes` [from `--preset`: 4]
+- `--split-policy {cluster,class}` dag only [from `--preset`: `cluster`]: how a split groups the leaf's images. `class` gives each class with at least 10% of the leaf's reach its own group and the rest one shared group (at most `--max-k` groups; the smallest qualifying classes fold into the shared one). If no class qualifies it falls back to `cluster`. `growth.jsonl` records `policy`, `groups` (classes per group) and `policy_fallback`.
 - `--growth-batches GROWTH_BATCHES` training batches used to measure per-leaf loss and to cluster the chosen leaf's images before a split [50]
 - `--split-noise SPLIT_NOISE` std of the noise added to the kept units of a split's new leaves [0.001]
 - `--merge` dag only: at each growth step, first merge node pairs whose outputs on the validation set are near-identical [off]
@@ -66,7 +69,7 @@ CIFAR-10 DAG run, a baseline CNN sized to match it, and a report with the baseli
 .venv/bin/python -m beamroot.report runs/<timestamp>-cifar-dag --baseline runs/<timestamp>-cifar-baseline
 ```
 
-DAG models train on the path loss and grow by cluster splits (see [ADR 0003](docs/adr/0003-path-loss-and-cluster-splits.md)).
+DAG models train on the path loss and grow by cluster splits (see [ADR 0003](docs/adr/0003-path-loss-and-cluster-splits.md)). By default a split may make up to 4 children, chosen by silhouette (the `explainable` preset, [ADR 0004](docs/adr/0004-growth-presets.md)).
 
 ## Evaluate
 
@@ -124,7 +127,9 @@ Flags:
 .venv/bin/python -m beamroot.experiment default
 ```
 
-Runs the `default` grid: every dataset in the grid × every seed, each as `train --model dag --merge --no-report`. Runs go to `runs/experiments/<name>/`, one directory per dataset and seed. A run that already has `model.pt` and `eval.json` is skipped, so a rerun resumes. The default grid is 6 runs: about 4 min of training each on MNIST and about 13 min on CIFAR-10 on Apple silicon, so roughly 50 min in total without `--report`. It ends by writing `summary.json` and `summary.md` (mean ± std per dataset, sorted by beam-1 accuracy).
+Runs the `default` grid: every dataset in the grid × every seed, each as `train --model dag --merge --no-report`. Runs go to `runs/experiments/<name>/`, one directory per dataset and seed. A run that already has `model.pt` and `eval.json` is skipped, so a rerun resumes. The default grid is 6 runs: about 4 min of training each on MNIST and about 13 min on CIFAR-10 on Apple silicon, so roughly 50 min in total without `--report`. It ends by writing `summary.json` and `summary.md` (mean ± std per dataset, sorted by beam-1 accuracy within a dataset). Columns: beam-1, beam-3 and soft accuracy, soft − beam-1, leaf count, mean k per split, links, mean nodes evaluated by beam 1, plus the routing diagnostics. Every run also writes `flow.txt` (the class flow tree).
+
+A grid entry in `GRIDS` may add `"variants": {name: [train flags]}` (e.g. `["--max-nodes", "19"]`). Each variant runs for every dataset × seed, run directories get the variant as a suffix, and the summary groups by dataset × variant with an extra `variant` column. Grids without variants (like `default`) are unchanged.
 
 Flags:
 

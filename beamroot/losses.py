@@ -10,16 +10,27 @@ def router_usage(log_reach: torch.Tensor, log_route: torch.Tensor) -> torch.Tens
     return (w[:, None] * log_route.exp()).sum(0) / w.sum().clamp(min=1e-12)
 
 
-def balance_loss(log_reach: dict, log_route: dict) -> torch.Tensor:
-    """Sum over routers of mean_reach * KL(usage || uniform).
+TARGET_MIN = 1e-3
 
-    Zero for uniform usage; the reach factor means unreachable routers add nothing.
+
+def balance_loss(log_reach: dict, log_route: dict, targets: dict | None = None) -> torch.Tensor:
+    """Sum over routers of mean_reach * KL(usage || target).
+
+    `targets` maps a router to its children's target shares (see RouterGraph.targets);
+    a router without one targets uniform. Target shares are clamped to at least
+    TARGET_MIN and renormalised so the KL stays finite. Zero when usage equals the
+    target; the reach factor means unreachable routers add nothing.
     """
+    targets = targets or {}
     total = 0.0
     for name, lr in log_route.items():
         k = lr.shape[1]
         u = router_usage(log_reach[name], lr).clamp(min=1e-12)
-        kl = (u * (u.log() + math.log(k))).sum()
+        if name in targets:
+            t = torch.as_tensor(targets[name], dtype=u.dtype, device=u.device).clamp(min=TARGET_MIN)
+            kl = (u * (u.log() - (t / t.sum()).log())).sum()
+        else:
+            kl = (u * (u.log() + math.log(k))).sum()
         total = total + log_reach[name].exp().mean() * kl
     return total if torch.is_tensor(total) else torch.zeros(())
 

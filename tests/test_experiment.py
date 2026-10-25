@@ -9,13 +9,15 @@ def write_jsonl(path, records):
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
 
 
-def fake_run(run_dir, beam1=0.90, soft=0.95, minutes=2.5, merge_kls=(0.03,), candidates=None):
+def fake_run(run_dir, beam1=0.90, soft=0.95, minutes=2.5, merge_kls=(0.03,), candidates=None,
+             split_extra=None):
     """A finished run directory in the format train.run + the harness write."""
     run_dir.mkdir(parents=True)
     (run_dir / "config.json").write_text(json.dumps({"dataset": "synthetic", "seed": 0}))
     (run_dir / "model.pt").write_bytes(b"")
     events = [{"epoch": 1, "merge": None, "threshold": 0.05, "candidates": {}},
-              {"epoch": 1, "split": "leaf1", "new_nodes": ["leaf2", "leaf3"], "num_nodes": 5}]
+              {"epoch": 1, "split": "leaf1", "new_nodes": ["leaf2", "leaf3"], "num_nodes": 5,
+               **(split_extra or {})}]
     events += [{"epoch": 2, "merge": ["leaf2", "leaf4"], "kl": kl, "removed": ["leaf4"],
                 "num_nodes": 6, "threshold": 0.05} for kl in merge_kls]
     events.append({"epoch": 3, "merge": None, "threshold": 0.05,
@@ -41,6 +43,74 @@ def test_run_metrics_from_a_finished_run_directory(tmp_path):
     assert m["merges"] == 1
     assert m["closest_merge_kl"] == pytest.approx(0.03)  # fired merges count as candidates
     assert m["train_minutes"] == pytest.approx(2.5)
+    assert m["beam1_nodes"] == pytest.approx(3.0)
+    assert m["beam3_acc"] is None  # old run: no beam-3 row
+    assert m["leaves"] == 3  # old run: counted from leaf_purity
+
+
+def test_run_metrics_defaults_old_runs_to_binary_and_link_free(tmp_path):
+    m = experiment.run_metrics(fake_run(tmp_path / "run"))
+    assert (m["mean_k"], m["links"]) == (2, 0)
+
+
+def test_run_metrics_reads_k_links_leaves_and_beam3(tmp_path):
+    run = fake_run(tmp_path / "run", split_extra={"k": 4, "links": [["leaf2", "leaf9"]]})
+    rows = json.loads((run / "eval.json").read_text())
+    rows.insert(1, {"mode": "beam 3", "accuracy": 0.93, "mean_nodes": 5.0})
+    (run / "eval.json").write_text(json.dumps(rows))
+    extra = json.loads((run / "experiment.json").read_text())
+    (run / "experiment.json").write_text(json.dumps({**extra, "leaves": 7}))
+    m = experiment.run_metrics(run)
+    assert (m["mean_k"], m["links"], m["leaves"], m["beam3_acc"]) == (4, 1, 7, 0.93)
+
+
+def test_variant_flags_reach_train_and_summary_groups_by_variant(tmp_path, monkeypatch):
+    monkeypatch.setitem(experiment.GRIDS, "vgrid", {
+        "datasets": ["synthetic"], "seeds": [0],
+        "variants": {"small": ["--max-nodes", "3"], "big": ["--max-nodes", "19"]}})
+    seen = []
+    real_run = experiment.train.run
+
+    def spy(args):
+        seen.append(args.max_nodes)
+        return real_run(args)
+
+    monkeypatch.setattr(experiment.train, "run", spy)
+    experiment.main(["vgrid", "--datasets", "synthetic", "--epochs", "2", "--device", "cpu",
+                     "--limit-batches", "2", "--runs-dir", str(tmp_path)])
+    assert seen == [3, 19]
+    summary = json.loads((tmp_path / "vgrid" / "summary.json").read_text())
+    assert sorted(r["variant"] for r in summary["rows"]) == ["big", "small"]
+    table = (tmp_path / "vgrid" / "summary.md").read_text()
+    assert "| dataset | variant | n |" in table
+
+
+def test_grid_epochs_per_dataset_unless_overridden(tmp_path, monkeypatch):
+    monkeypatch.setitem(experiment.GRIDS, "egrid", {
+        "datasets": ["synthetic"], "seeds": [0], "epochs": {"synthetic": 1}})
+    seen = []
+    real_run = experiment.train.run
+
+    def spy(args):
+        seen.append(args.epochs)
+        return real_run(args)
+
+    monkeypatch.setattr(experiment.train, "run", spy)
+    common = ["--device", "cpu", "--limit-batches", "2"]
+    experiment.main(["egrid", "--runs-dir", str(tmp_path / "a"), *common])
+    experiment.main(["egrid", "--epochs", "2", "--runs-dir", str(tmp_path / "b"), *common])
+    assert seen == [1, 2]
+
+
+def test_variant_rows_sort_by_beam1_within_dataset(tmp_path):
+    runs = []
+    for i, (dataset, variant, beam1) in enumerate([
+            ("mnist", "a", 0.80), ("cifar10", "a", 0.50), ("mnist", "b", 0.90)]):
+        m = experiment.run_metrics(fake_run(tmp_path / f"r{i}", beam1=beam1))
+        runs.append({"dataset": dataset, "variant": variant, "seed": 0, **m})
+    rows = experiment.summarise(runs, ["mnist", "cifar10"])
+    assert [(r["dataset"], r["variant"]) for r in rows] == [
+        ("mnist", "b"), ("mnist", "a"), ("cifar10", "a")]
 
 
 GRID = ["default", "--datasets", "synthetic", "--seeds", "0", "1", "--epochs", "2",
@@ -70,12 +140,14 @@ def test_two_seed_grid_runs_end_to_end_and_writes_the_table(tmp_path):
     assert "root" in measured["router_entropy"]
     assert measured["leaf_purity"] and all(0 < p <= 1 for p in measured["leaf_purity"].values())
     modes = [r["mode"] for r in json.loads((exp_dir / runs[1] / "eval.json").read_text())]
-    assert modes == ["beam 1", "soft"]
+    assert modes == ["beam 1", "beam 3", "soft"]
+    assert (exp_dir / runs[1] / "flow.txt").read_text().strip()
     summary = json.loads((exp_dir / "summary.json").read_text())
     assert [(r["dataset"], r["n"]) for r in summary["rows"]] == [("synthetic", 2)]
     assert len(summary["runs"]) == 2
     table = (exp_dir / "summary.md").read_text()
-    for col in ["beam-1 acc", "soft acc", "soft − beam-1", "split-router entropy",
+    for col in ["beam-1 acc", "beam-3 acc", "soft acc", "soft − beam-1", "leaves", "mean k",
+                "links", "beam-1 nodes", "split-router entropy",
                 "leaf purity", "merges", "closest merge KL", "train min"]:
         assert col in table
     assert "| synthetic | 2 |" in table

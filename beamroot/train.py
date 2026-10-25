@@ -14,6 +14,12 @@ from beamroot.models.baseline import BaselineCNN, count_params, match_width
 from beamroot.models.dag import DAGRouterModel
 from beamroot.runs import create_run_dir, log_metrics
 
+# Growth presets (experiment 0002, ADR 0004). Explicit --max-k / --split-policy override them.
+PRESETS = {
+    "explainable": {"max_k": 4, "split_policy": "cluster"},  # unsupervised
+    "pure": {"max_k": 4, "split_policy": "class"},  # supervised: uses labels
+}
+
 
 def evaluate(model, loader, device, limit_batches=None):
     model.eval()
@@ -46,7 +52,8 @@ def train_epoch(model, loader, opt, device, limit_batches=None, balance_weight=0
             ce = path_loss(out["log_reach"], out["leaf_log_probs"], y)
             loss, bal = ce, 0.0
             if balance_weight:
-                bal = balance_weight * balance_loss(out["log_reach"], out["log_route"])
+                bal = balance_weight * balance_loss(out["log_reach"], out["log_route"],
+                                                    model.graph.targets)
                 loss = ce + bal
             ce_sum += ce.item()
             bal_sum += float(bal)
@@ -154,12 +161,13 @@ def run(args) -> dict:
                 if not merges:
                     print(f"  merge: no pair below sym KL {args.merge_threshold}", flush=True)
             event = grow(model, train_loader, device, epoch, run_dir, args.max_nodes,
-                         limit_batches=args.growth_batches, noise=args.split_noise)
-            fresh = event["new_nodes"] if event else []
+                         limit_batches=args.growth_batches, noise=args.split_noise,
+                         max_k=args.max_k, policy=args.split_policy)
+            fresh = event["new_nodes"] if event else []  # all k of them
             if event or merges:
                 opt = rebuild_optimizer(model, opt)
             if event:
-                print(f"  split {event['split']} -> {event['new_nodes']} "
+                print(f"  split {event['split']} -> {event['new_nodes']} (k {event['k']}) "
                       f"({event['num_nodes']} nodes)", flush=True)
                 if "cluster_sizes" in event:
                     print(f"  cluster sizes {event['cluster_sizes']} router pre-train loss "
@@ -169,10 +177,18 @@ def run(args) -> dict:
     if growing:  # growth changes the size; config.json records the final count
         config["params"] = count_params(model)
         (run_dir / "config.json").write_text(json.dumps(config, indent=2))
-    if isinstance(model, DAGRouterModel) and not args.no_report:
-        from beamroot.report import render_report
-        for path in render_report(run_dir, device).values():
-            print(f"wrote {path}", flush=True)
+    if isinstance(model, DAGRouterModel):
+        if not args.no_report:
+            from beamroot.report import render_report
+            for path in render_report(run_dir, device).values():
+                print(f"wrote {path}", flush=True)
+            print((run_dir / "flow.txt").read_text(), flush=True)
+        else:
+            from beamroot.analysis import class_flow, collect_stats
+            stats = collect_stats(model, test_loader, device, model.num_classes,
+                                  args.limit_batches)
+            print(class_flow(model.graph, stats["class_mass"],
+                             dataset_info(config["dataset"]).get("classes")), flush=True)
     return {"run_dir": run_dir, "first_loss": first_loss, **last}
 
 
@@ -197,6 +213,19 @@ def parse_args(argv=None):
                    help="dag only: split the worst leaf every K epochs (0 disables)")
     p.add_argument("--max-nodes", type=int, default=7,
                    help="dag only: stop growing when a split would exceed this many graph nodes")
+    p.add_argument("--preset", choices=sorted(PRESETS), default="explainable",
+                   help="dag only: growth defaults. explainable = unsupervised k-way cluster "
+                        "splits; pure = supervised k-way class splits. --max-k and "
+                        "--split-policy override it (--max-k 2 gives binary splits)")
+    p.add_argument("--max-k", type=int, default=None,
+                   help="dag only: a split may make up to this many new leaves; k is picked "
+                        "by silhouette of the leaf's activation clusters (2 unless a larger "
+                        "k separates clearly better). Default from --preset")
+    p.add_argument("--split-policy", choices=["cluster", "class"], default=None,
+                   help="dag only: how a split groups the leaf's images. cluster = k-means "
+                        "on activations; class = one group per class with >= 10%% of the "
+                        "leaf's reach, the rest share one (at most --max-k groups). "
+                        "Default from --preset")
     p.add_argument("--growth-batches", type=int, default=50,
                    help="training batches used to measure per-leaf loss and to cluster "
                         "the chosen leaf's images before a split")
@@ -213,7 +242,11 @@ def parse_args(argv=None):
     p.add_argument("--limit-batches", type=int, default=None)
     p.add_argument("--name", default=None)
     p.add_argument("--runs-dir", default="runs")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    for key, value in PRESETS[args.preset].items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+    return args
 
 
 def main(argv=None):

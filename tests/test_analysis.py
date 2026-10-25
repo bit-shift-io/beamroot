@@ -101,3 +101,41 @@ def test_collect_stats_router_entropy_is_mean_per_image_entropy():
     assert ent["root"] == pytest.approx(h([0.75, 0.25]))
     assert ent["a"] == pytest.approx(math.log(2))
     assert ent["b"] == pytest.approx(h([0.2, 0.8]))
+
+
+def flow_mass():
+    # 4 classes; root mass 100 each
+    return {"root": [100, 100, 100, 100], "a": [50, 10, 9, 0], "b": [50, 90, 91, 100],
+            "la": [50, 0, 0, 0], "shared": [0, 10, 9, 0], "lb": [0, 90, 91, 100]}
+
+
+def test_class_flow_tree_with_shared_leaf_prints_subtree_once():
+    from beamroot.analysis import class_flow
+    lines = class_flow(diamond(), flow_mass()).splitlines()
+    assert lines[0] == "root  reach 100%  {all classes}"
+    # a holds exactly 50% / 10% of classes 0 / 1 -> in set; class 2 at 9% -> out
+    assert lines[1] == "├─ a  reach 17%  {0,1}"
+    assert lines[2] == "│  ├─ la  reach 12%  0 (100%)  ← pure"
+    assert lines[3] == "│  └─ shared  reach 5%  1 (53%), 2 (47%)"
+    assert lines[4].startswith("└─ b  reach 83%  {")
+    assert lines[5] == "   ├─ → shared  (shared, see above)"
+    assert lines[6].startswith("   └─ lb  reach 70%")
+    assert len(lines) == 7
+
+
+def test_class_flow_leaf_thresholds_are_inclusive():
+    from beamroot.analysis import class_flow
+    g = RouterGraph()
+    g.add_node("root", "router")
+    g.add_node("x", "leaf", parents=["root"])
+    g.add_node("y", "leaf", parents=["root"])
+    mass = {"root": [100, 100], "x": [95, 5], "y": [5, 95]}
+    lines = class_flow(g, mass).splitlines()
+    assert lines[1] == "├─ x  reach 50%  0 (95%), 1 (5%)  ← pure"
+    assert "← pure" in lines[2] and "0 (5%)" in lines[2]
+
+
+def test_class_flow_uses_class_names_when_given():
+    from beamroot.analysis import class_flow
+    out = class_flow(diamond(), flow_mass(), class_names=["w", "x", "y", "z"])
+    assert "{w,x}" in out and "w (100%)" in out

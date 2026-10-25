@@ -20,6 +20,9 @@ class RouterGraph:
     def __init__(self):
         self.nodes: dict[str, Node] = {}
         self.edges: list[tuple[str, str]] = []
+        # Router -> balance target: its children's reach shares at split time, in
+        # child order. Routers without one target uniform (see losses.balance_loss).
+        self.targets: dict[str, list[float]] = {}
 
     def add_node(self, name: str, kind: str, parents: list[str] | None = None) -> Node:
         if name in self.nodes:
@@ -54,9 +57,10 @@ class RouterGraph:
             if c != name:
                 self.nodes[c].parents.remove(p)
         del self.nodes[name]
+        self.targets.pop(name, None)
 
-    def split(self, name: str) -> tuple[str, str]:
-        """Turn leaf `name` into a router with two new leaf children (see CONTEXT.md: Split).
+    def split(self, name: str, k: int = 2) -> tuple[str, ...]:
+        """Turn leaf `name` into a router with `k` new leaf children (see CONTEXT.md: Split).
 
         The node keeps its name and all its parents. Returns the new leaves' names.
         """
@@ -64,7 +68,7 @@ class RouterGraph:
             raise ValueError(f"only leaves can be split, {name!r} is a router")
         self.nodes[name].kind = "router"
         new = []
-        for _ in range(2):
+        for _ in range(k):
             new.append(self._fresh_name("leaf"))
             self.add_node(new[-1], "leaf", parents=[name])
         return tuple(new)
@@ -156,7 +160,8 @@ class RouterGraph:
 
     def to_dict(self) -> dict:
         return {"nodes": [{"name": n.name, "kind": n.kind} for n in self.nodes.values()],
-                "edges": [list(e) for e in self.edges]}
+                "edges": [list(e) for e in self.edges],
+                "targets": {n: list(t) for n, t in self.targets.items()}}
 
     @classmethod
     def from_dict(cls, d: dict) -> "RouterGraph":
@@ -165,4 +170,5 @@ class RouterGraph:
             g.add_node(n["name"], n["kind"])
         for p, c in d["edges"]:
             g.add_edge(p, c)
+        g.targets = {n: list(t) for n, t in d.get("targets", {}).items()}  # optional: older runs
         return g
