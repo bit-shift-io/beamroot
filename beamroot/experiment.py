@@ -32,6 +32,12 @@ GRIDS = {
                    "binary": [*_SPLIT_FLAGS, "--max-k", "2"],
                    "kway-cluster": [*_SPLIT_FLAGS, "--max-k", "4", "--split-policy", "cluster"],
                    "kway-class": [*_SPLIT_FLAGS, "--max-k", "4", "--split-policy", "class"]}},
+    # Experiment 0003: link policies, on the explainable preset chosen by 0002.
+    "links": {"datasets": ["mnist", "cifar10"], "seeds": [0, 1, 2],
+              "epochs": {"mnist": 12, "cifar10": 15},
+              "variants": {policy: [*_SPLIT_FLAGS, "--preset", "explainable",
+                                    "--link-policy", policy]
+                           for policy in ("none", "loss", "class")}},
 }
 METRICS = ["beam1_acc", "beam3_acc", "soft_acc", "gap", "leaves", "mean_k", "links",
            "beam1_nodes", "split_router_entropy", "leaf_purity", "merges",

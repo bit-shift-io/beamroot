@@ -11,4 +11,6 @@ metadata:
 - Write one `docs/experiments/NNNN-*.md` per experiment, from the template in `docs/experiments/README.md`.
 - Record every variant's strengths, weaknesses and likely reason, plus ideas left untried.
 - Judge variants on beam-1 test accuracy first. Soft accuracy is reported, not ranked.
+- With few seeds, call a gap a tie unless it is statistically meaningful (e.g. a t-test), not merely past one std. On a tie, prefer the more explainable graph (shorter beam-1 paths, purer leaves).
+- Variants must differ only in the thing being compared. Code that draws from the global RNG in some variants only (e.g. iterating an extra data loader) shifts every later random draw and fakes a difference. Wrap such work in `torch.random.fork_rng`, and check that a variant whose feature never triggers matches the baseline exactly.
 - Structural decisions (merges, thresholds) read the validation set, never the test set.

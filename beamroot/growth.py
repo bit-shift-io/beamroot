@@ -170,6 +170,83 @@ def class_groups(y: torch.Tensor, w: torch.Tensor, max_k: int = 2):
     return groups, labels
 
 
+LINK_RATIO = 0.5  # loss link policy: a leaf links if its loss is below this x the split leaf's
+
+
+def choose_links(group_losses: list[dict[str, float]],
+                 own: list[float]) -> dict[int, tuple[str, float]]:
+    """Which split groups link to an existing leaf (loss link policy, see CONTEXT.md: Link).
+
+    `group_losses[g]` maps each candidate leaf to its mean NLL on group g's validation
+    images, `own[g]` is the split leaf's. A group links to its lowest-loss leaf if that
+    loss is below `LINK_RATIO` x `own[g]`; groups with `own[g]` of 0 never link. If
+    every group would link, the weakest link (highest ratio) stays fresh.
+    Returns {group: (leaf, ratio)}.
+    """
+    links = {}
+    for g, (losses, base) in enumerate(zip(group_losses, own)):
+        if not losses or base <= 0:
+            continue
+        leaf = min(losses, key=losses.get)
+        ratio = losses[leaf] / base
+        if ratio < LINK_RATIO:
+            links[g] = (leaf, ratio)
+    if links and len(links) == len(own):
+        del links[max(links, key=lambda g: links[g][1])]
+    return links
+
+
+LINK_PURITY = 0.9  # class link policy: a leaf links if its class purity is at least this
+
+
+def choose_class_links(group_classes: list, leaf_stats: dict[str, tuple]) -> dict[int, tuple]:
+    """Which split groups link to an existing leaf (class link policy, see CONTEXT.md: Link).
+
+    `group_classes[g]` is group g's dominant class on the validation set (None if empty),
+    `leaf_stats` maps each candidate leaf to (dominant class, purity). A group links to
+    the highest-purity leaf of the same class whose purity is >= `LINK_PURITY`. If every
+    group would link, the weakest link (lowest purity) stays fresh.
+    Returns {group: (leaf, class, purity)}.
+    """
+    links = {}
+    for g, cls in enumerate(group_classes):
+        cands = [(pur, leaf) for leaf, (c, pur) in leaf_stats.items()
+                 if cls is not None and c == cls and pur >= LINK_PURITY]
+        if cands:
+            pur, leaf = max(cands, key=lambda t: t[0])
+            links[g] = (leaf, cls, pur)
+    if links and len(links) == len(group_classes):
+        del links[min(links, key=lambda g: links[g][2])]
+    return links
+
+
+def _val_class_mass(model, name, loader, device, limit_batches, assign, k):
+    """Validation class mass on the existing graph (eval mode, no gradients):
+    ([k group masses], {other leaf: mass}), each a per-class list. A group's mass is
+    reach of `name` summed per class over the images `assign` puts in it; a leaf's is
+    its own reach per class."""
+    leaves = [n for n in model.graph.leaves() if n != name]
+    was_training = model.training
+    model.eval()
+    gm, lm = None, None
+    with torch.no_grad():
+        for x, y in islice(loader, limit_batches):
+            x, y = x.to(device), y.to(device)
+            out = model.route(x)
+            c = out["leaf_log_probs"][name].shape[1]
+            if gm is None:
+                gm = torch.zeros(k, c, device=device)
+                lm = {n: torch.zeros(c, device=device) for n in leaves}
+            g = assign(model.nodes[name].net[:2](model.stem(x).flatten(1)), y)
+            r = out["log_reach"][name].exp()
+            for i in range(k):
+                gm[i].index_add_(0, y[g == i], r[g == i])
+            for n in leaves:
+                lm[n].index_add_(0, y, out["log_reach"][n].exp())
+    model.train(was_training)
+    return gm.tolist(), {n: v.tolist() for n, v in lm.items()}
+
+
 def _leaf_inputs(model, name, loader, device, limit_batches):
     """(stem features, hidden activations of leaf `name`, reach of `name`, labels) over
     the loader's batches, in eval mode (no dropout) and without gradients."""
@@ -223,7 +300,8 @@ def _pretrain_router(router, feats, labels, w, steps: int, lr: float) -> float:
 def cluster_split(model, name: str, loader, device, noise: float = 1e-3,
                   limit_batches=None, pretrain_steps: int = 100,
                   pretrain_lr: float = 1e-2, max_k: int = 2,
-                  policy: str = "cluster") -> tuple[tuple[str, ...], dict]:
+                  policy: str = "cluster", link_policy: str = "none",
+                  val_loader=None) -> tuple[tuple[str, ...], dict]:
     """Split leaf `name` with cluster initialisation (see CONTEXT.md: Split initialisation).
 
     The leaf's images (the loader's first `limit_batches` batches) are split into k
@@ -237,6 +315,19 @@ def cluster_split(model, name: str, loader, device, noise: float = 1e-3,
     With `policy="class"` the groups come from `class_groups` instead of k-means
     (k = the number of groups, info gains `groups`); if no class qualifies it falls
     back to the cluster policy and records `policy_fallback`.
+
+    With `link_policy="class"`, a group links to an existing leaf of the same dominant
+    validation class with purity >= `LINK_PURITY` (`choose_class_links`); info gains
+    `links` {group: {"policy", "leaf", "class", "purity"}}. Otherwise mechanics are as below.
+
+    With `link_policy="loss"`, before anything changes, each group's images in
+    `val_loader` (joined by nearest group centre, or by label under `class`) are scored
+    on the existing graph; a group links to an existing leaf per `choose_links`, and
+    info gains `links` {group: {"leaf", "ratio"}} and `link_ratios` (every scored
+    group's best candidate, linked or not). Only unlinked groups get fresh
+    leaves (returned); each distinct linked leaf becomes one more router output, shared
+    by the groups that link to it, and the router's pre-train labels and balance
+    target follow those outputs.
     """
     feats, hidden, reach, ys = _leaf_inputs(model, name, loader, device, limit_batches)
     grouped = class_groups(ys, reach, max_k) if policy == "class" else None
@@ -257,19 +348,116 @@ def cluster_split(model, name: str, loader, device, noise: float = 1e-3,
     if min(sizes) == 0:
         info["fallback"] = "copy"
         return split_leaf(model, name, noise), info
+    links = {}
+    if link_policy == "class":
+        from beamroot.analysis import purity
+        assign = (_class_assign(groups) if grouped
+                  else _centre_assign(hidden, reach, labels, k))
+        with torch.random.fork_rng(devices=[]):  # keep training's RNG stream as under `none`
+            gmass, lmass = _val_class_mass(model, name, val_loader, device, limit_batches,
+                                           assign, k)
+        gclass = [purity(m)[0] for m in gmass]
+        lstats = {n: purity(m) for n, m in lmass.items()}
+        links = choose_class_links(gclass, lstats)
+        info["link_candidates"] = {}
+        for g, cls in enumerate(gclass):
+            cands = [(p, n) for n, (c, p) in lstats.items() if cls is not None and c == cls]
+            if cands:
+                p, n = max(cands, key=lambda t: t[0])
+                info["link_candidates"][str(g)] = {"leaf": n, "class": cls, "purity": p}
+        info["links"] = {str(g): {"policy": "class", "leaf": leaf, "class": cls,
+                                 "purity": pur}
+                         for g, (leaf, cls, pur) in links.items()}
+    if link_policy == "loss":
+        assign = (_class_assign(groups) if grouped
+                  else _centre_assign(hidden, reach, labels, k))
+        with torch.random.fork_rng(devices=[]):  # keep training's RNG stream as under `none`
+            group_losses, own = _val_group_losses(model, name, val_loader, device,
+                                                  limit_batches, assign, k)
+        links = choose_links(group_losses, own)
+        best = {g: min(ls, key=ls.get) for g, ls in enumerate(group_losses) if ls and own[g] > 0}
+        info["link_ratios"] = {str(g): {"leaf": leaf, "ratio": group_losses[g][leaf] / own[g]}
+                               for g, leaf in best.items()}
+        info["links"] = {str(g): {"leaf": leaf, "ratio": r} for g, (leaf, r) in links.items()}
     old = model.nodes[name]
     masks = neuron_masks(hidden, reach, labels, k)
-    new = model.graph.split(name, k)
+    fresh_groups = [g for g in range(k) if g not in links]
+    linked = list(dict.fromkeys(links[g][0] for g in sorted(links)))
+    new = model.graph.split(name, len(fresh_groups))
+    for leaf in linked:
+        model.graph.add_edge(name, leaf)
+    column = {g: i for i, g in enumerate(fresh_groups)}  # group -> router output
+    column.update({g: len(fresh_groups) + linked.index(leaf) for g, (leaf, *_) in links.items()})
     model.nodes[name] = model.build_node(name).to(feats.device)
-    for n, keep in zip(new, masks):
+    for n, g in zip(new, fresh_groups):
         fresh = model.build_node(n).to(feats.device)
-        model.nodes[n] = _masked_leaf(old, fresh, keep, noise)
+        model.nodes[n] = _masked_leaf(old, fresh, masks[g], noise)
+    outputs = torch.tensor([column[g] for g in range(k)], device=labels.device)[labels]
     info["router_pretrain_loss"] = _pretrain_router(
-        model.nodes[name], feats, labels, reach, pretrain_steps, pretrain_lr)
+        model.nodes[name], feats, outputs, reach, pretrain_steps, pretrain_lr)
     total = sum(info["cluster_reach"])
     if total > 0:
-        model.graph.targets[name] = [r / total for r in info["cluster_reach"]]
+        shares = [0.0] * (len(fresh_groups) + len(linked))
+        for g, r in enumerate(info["cluster_reach"]):
+            shares[column[g]] += r
+        model.graph.targets[name] = [r / total for r in shares]
     return new, info
+
+
+def _centre_assign(hidden, reach, labels, k):
+    """Group of an image = nearest reach-weighted group centre of the split leaf's
+    hidden activations (cluster split policy)."""
+    centres = []
+    for c in range(k):
+        wc = (labels == c).float() * reach
+        centres.append((wc[:, None] * hidden).sum(0) / wc.sum().clamp(min=1e-12))
+    centres = torch.stack(centres)
+    return lambda h, y: torch.cdist(h, centres).argmin(1)
+
+
+def _class_assign(groups):
+    """Group of an image = the group holding its label (class split policy); -1 for
+    classes in no group."""
+    def assign(h, y):
+        out = torch.full_like(y, -1)
+        for i, g in enumerate(groups):
+            for c in g:  # no torch.isin: not implemented on MPS
+                out[y == c] = i
+        return out
+    return assign
+
+
+def _val_group_losses(model, name, loader, device, limit_batches, assign, k):
+    """Per split group, measured on the existing graph over the loader's batches (eval
+    mode, no gradients): ({other leaf: mean NLL}, the split leaf's mean NLL). Images
+    join a group by `assign(hidden activations of name, labels)`; means are weighted
+    by each image's reach of `name`. A group with no reach gets ({}, 0.0)."""
+    leaves = model.graph.leaves()
+    was_training = model.training
+    model.eval()
+    groups, reach, nll = [], [], []
+    with torch.no_grad():
+        for x, y in islice(loader, limit_batches):
+            x, y = x.to(device), y.to(device)
+            out = model.route(x)
+            groups.append(assign(model.nodes[name].net[:2](model.stem(x).flatten(1)), y))
+            reach.append(out["log_reach"][name].exp())
+            nll.append(torch.stack([-out["leaf_log_probs"][n].gather(1, y[:, None]).squeeze(1)
+                                    for n in leaves], 1))
+    model.train(was_training)
+    groups, reach, nll = torch.cat(groups), torch.cat(reach), torch.cat(nll)
+    group_losses, own = [], []
+    for g in range(k):
+        w = (groups == g).float() * reach
+        if w.sum() <= 0:
+            group_losses.append({})
+            own.append(0.0)
+            continue
+        mean = ((w[:, None] * nll).sum(0) / w.sum()).tolist()
+        losses = dict(zip(leaves, mean))
+        own.append(losses.pop(name))
+        group_losses.append(losses)
+    return group_losses, own
 
 
 def node_outputs(model, out: dict) -> dict:
@@ -402,15 +590,18 @@ def save_graph_snapshot(model, run_dir, epoch: int) -> Path:
 
 def grow(model, loader, device, epoch: int, run_dir, max_nodes: int,
          limit_batches=None, noise: float = 1e-3, max_k: int = 2,
-         policy: str = "cluster") -> dict | None:
+         policy: str = "cluster", link_policy: str = "none",
+         val_loader=None) -> dict | None:
     """One growth step: cluster-split the leaf with the highest reach-weighted loss
     (ADR 0003), clustering the same batches the loss is measured on.
 
     The split is k-way for k up to `max_k` and up to what fits in `max_nodes` graph
     nodes; does nothing (returns None) if even a 2-way split would exceed it.
     Otherwise appends the event (with k, silhouettes, cluster sizes, router pre-train
-    loss and any fallback) to <run_dir>/growth.jsonl, writes a graph snapshot to
-    <run_dir>/graphs/epoch_NNN.json, and returns the event.
+    loss, any fallback and, under a link policy, `links`) to <run_dir>/growth.jsonl,
+    writes a graph snapshot to <run_dir>/graphs/epoch_NNN.json, and returns the event.
+    With `link_policy="loss"`, links are decided on `val_loader` (see `cluster_split`);
+    `new_nodes` lists only the fresh leaves.
     """
     room = min(max_k, max_nodes - len(model.graph.nodes))
     if room < 2:
@@ -418,7 +609,8 @@ def grow(model, loader, device, epoch: int, run_dir, max_nodes: int,
     losses = leaf_losses(model, loader, device, limit_batches)
     target = choose_leaf(losses)
     new, info = cluster_split(model, target, loader, device, noise, limit_batches,
-                             max_k=room, policy=policy)
+                             max_k=room, policy=policy, link_policy=link_policy,
+                             val_loader=val_loader)
     event = {"epoch": epoch, "split": target, "new_nodes": list(new),
              "num_nodes": len(model.graph.nodes), "leaf_losses": losses, **info}
     with open(Path(run_dir) / "growth.jsonl", "a") as f:

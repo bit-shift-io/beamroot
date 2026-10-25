@@ -267,3 +267,13 @@ def test_train_protects_the_previous_splits_new_leaves_at_each_merge_check(tmp_p
     splits = {e["epoch"]: set(e["new_nodes"]) for e in events if "split" in e}
     assert sorted(splits) == [1, 2]
     assert seen == {1: set(), 2: splits[1], 3: splits[2]}
+
+
+def test_after_a_link_only_fresh_leaves_are_protected_and_split_siblings_never_pair():
+    from beamroot.growth import candidate_pairs
+    g = chain()
+    (fresh,) = g.split("leaf2", 1)
+    g.add_edge("leaf2", "leaf0")  # leaf2's other group linked to leaf0
+    # the linked leaf stays a candidate; it never pairs with its new sibling
+    assert set(candidate_pairs(g, protected={fresh})) == {("leaf0", "leaf4"), ("leaf0", "leaf5")}
+    assert ("leaf0", fresh) not in candidate_pairs(g)

@@ -14,10 +14,11 @@ from beamroot.models.baseline import BaselineCNN, count_params, match_width
 from beamroot.models.dag import DAGRouterModel
 from beamroot.runs import create_run_dir, log_metrics
 
-# Growth presets (experiment 0002, ADR 0004). Explicit --max-k / --split-policy override them.
+# Growth presets (experiment 0002, ADR 0004). Explicit --max-k / --split-policy /
+# --link-policy override them.
 PRESETS = {
-    "explainable": {"max_k": 4, "split_policy": "cluster"},  # unsupervised
-    "pure": {"max_k": 4, "split_policy": "class"},  # supervised: uses labels
+    "explainable": {"max_k": 4, "split_policy": "cluster", "link_policy": "none"},  # unsupervised
+    "pure": {"max_k": 4, "split_policy": "class", "link_policy": "none"},  # supervised
 }
 
 
@@ -110,6 +111,8 @@ def run(args) -> dict:
     device = select_device(args.device)
     if args.merge and args.val_size == 0:
         raise SystemExit("--merge needs a validation set; use --val-size > 0")
+    if args.link_policy != "none" and args.val_size == 0:
+        raise SystemExit("--link-policy needs a validation set; use --val-size > 0")
     train_loader, val_loader, test_loader = get_loaders(
         args.dataset, args.batch_size, args.seed, args.val_size)
     if args.epochs is None:
@@ -162,8 +165,9 @@ def run(args) -> dict:
                     print(f"  merge: no pair below sym KL {args.merge_threshold}", flush=True)
             event = grow(model, train_loader, device, epoch, run_dir, args.max_nodes,
                          limit_batches=args.growth_batches, noise=args.split_noise,
-                         max_k=args.max_k, policy=args.split_policy)
-            fresh = event["new_nodes"] if event else []  # all k of them
+                         max_k=args.max_k, policy=args.split_policy,
+                         link_policy=args.link_policy, val_loader=val_loader)
+            fresh = event["new_nodes"] if event else []  # fresh leaves only, not linked ones
             if event or merges:
                 opt = rebuild_optimizer(model, opt)
             if event:
@@ -173,6 +177,10 @@ def run(args) -> dict:
                     print(f"  cluster sizes {event['cluster_sizes']} router pre-train loss "
                           f"{event['router_pretrain_loss']} fallback {event['fallback']}",
                           flush=True)
+                for g, link in event.get("links", {}).items():
+                    how = (f"loss ratio {link['ratio']:.3f}" if "ratio" in link else
+                           f"class {link['class']}, purity {link['purity']:.3f}")
+                    print(f"  group {g} linked to {link['leaf']} ({how})", flush=True)
     torch.save(save_payload(model), run_dir / "model.pt")
     if growing:  # growth changes the size; config.json records the final count
         config["params"] = count_params(model)
@@ -226,9 +234,14 @@ def parse_args(argv=None):
                         "on activations; class = one group per class with >= 10%% of the "
                         "leaf's reach, the rest share one (at most --max-k groups). "
                         "Default from --preset")
+    p.add_argument("--link-policy", choices=["none", "loss", "class"], default=None,
+                   help="dag only: when a split group links to an existing leaf instead of "
+                        "a fresh one. loss = the leaf's loss on the group's validation "
+                        "images is below half the split leaf's. Default from --preset")
     p.add_argument("--growth-batches", type=int, default=50,
                    help="training batches used to measure per-leaf loss and to cluster "
-                        "the chosen leaf's images before a split")
+                        "the chosen leaf's images before a split (and validation batches "
+                        "scored by a link policy)")
     p.add_argument("--split-noise", type=float, default=1e-3,
                    help="std of the noise added to the kept units of a split's new leaves "
                         "(and to both copies when a split falls back to copy)")

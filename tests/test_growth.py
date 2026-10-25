@@ -449,3 +449,219 @@ def test_preset_sets_split_flags_and_explicit_flags_override():
     assert (pure.max_k, pure.split_policy) == (4, "class")
     binary = parse_args(["--preset", "pure", "--max-k", "2", "--split-policy", "cluster"])
     assert (binary.max_k, binary.split_policy) == (2, "cluster")
+
+
+def test_choose_links_threshold_lowest_wins_and_one_group_stays_fresh():
+    from beamroot.growth import LINK_RATIO, choose_links
+    assert LINK_RATIO == 0.5
+    # group 0: leafA at 0.4 of the split leaf's loss links; group 1: 0.6 does not
+    links = choose_links([{"leafA": 0.4, "leafB": 0.9}, {"leafA": 0.6}], [1.0, 1.0])
+    assert links == {0: ("leafA", pytest.approx(0.4))}
+    # lowest loss wins
+    links = choose_links([{"leafA": 0.3, "leafB": 0.1}, {}], [1.0, 2.0])
+    assert links == {0: ("leafB", pytest.approx(0.1))}
+    # all would link: the weakest link (highest ratio) stays fresh
+    links = choose_links([{"a": 0.2}, {"b": 0.8}, {"a": 0.1}], [1.0, 2.0, 1.0])
+    assert links == {0: ("a", pytest.approx(0.2)), 2: ("a", pytest.approx(0.1))}
+    # two groups linking to one leaf both keep it
+    links = choose_links([{"a": 0.1}, {"a": 0.2}, {"b": 5.0}], [1.0, 1.0, 1.0])
+    assert {g: leaf for g, (leaf, _) in links.items()} == {0: "a", 1: "a"}
+    # a group whose split-leaf loss is zero (or has no images) never links
+    assert choose_links([{"a": 0.0}, {"a": 0.0}], [0.0, 1.0]) == {1: ("a", 0.0)}
+
+
+def banded_loader(bands, n_per=32, batch_size=32, seed=0):
+    """Images bright in one horizontal band each, labelled by band index (band order)."""
+    from torch.utils.data import DataLoader, TensorDataset
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(n_per * len(bands), 1, 28, 28, generator=g) * 0.1
+    for i, rows in enumerate(bands):
+        x[i * n_per:(i + 1) * n_per, :, rows] += 1.0
+    y = torch.arange(len(bands)).repeat_interleave(n_per)
+    return DataLoader(TensorDataset(x, y), batch_size=batch_size), x, y
+
+
+def set_leaf_probs(model, name, probs: dict):
+    """Force a leaf to predict the given class probabilities (rest spread evenly) for any input."""
+    last = model.nodes[name].net[-1]
+    n = last.out_features
+    p = torch.full((n,), (1 - sum(probs.values())) / (n - len(probs)))
+    for c, v in probs.items():
+        p[c] = v
+    with torch.no_grad():
+        last.weight.zero_()
+        last.bias.copy_(p.log())
+
+
+HALVES = (slice(0, 14), slice(14, 28))
+THIRDS = (slice(0, 9), slice(9, 19), slice(19, 28))
+
+
+def test_class_group_links_to_a_leaf_that_already_predicts_it():
+    from beamroot.growth import cluster_split
+    torch.manual_seed(0)
+    model = DAGRouterModel()
+    set_leaf_probs(model, "leaf1", {0: 0.99})  # leaf1 knows class 0 only
+    loader, x, y = banded_loader(HALVES)
+    val, _, _ = banded_loader(HALVES, seed=1)
+    new, info = cluster_split(model, "leaf0", loader, "cpu", max_k=4, policy="class",
+                              link_policy="loss", val_loader=val)
+    assert info["groups"] == [[0], [1]] and info["k"] == 2
+    assert list(info["links"]) == ["0"] and info["links"]["0"]["leaf"] == "leaf1"
+    assert info["links"]["0"]["ratio"] < 0.5
+    # every group's best candidate is logged, linked or not
+    assert info["link_ratios"]["0"] == info["links"]["0"]
+    assert info["link_ratios"]["1"]["leaf"] == "leaf1"
+    assert info["link_ratios"]["1"]["ratio"] >= 0.5
+    assert len(new) == 1
+    assert model.graph.children("leaf0") == [new[0], "leaf1"]
+    assert model.graph.parents("leaf1") == ["root", "leaf0"]
+    assert set(model.nodes) == set(model.graph.nodes)
+    reach = info["cluster_reach"]
+    assert model.graph.targets["leaf0"] == pytest.approx([reach[1] / sum(reach),
+                                                          reach[0] / sum(reach)])
+    model.eval()
+    with torch.no_grad():
+        route = model.route(x)["log_route"]["leaf0"].exp()
+    assert route.shape == (64, 2)
+    assert route[y == 1, 0].mean() > 0.9 and route[y == 0, 1].mean() > 0.9
+
+
+def test_cluster_groups_linking_to_one_leaf_share_one_router_output():
+    from beamroot.growth import cluster_split
+    torch.manual_seed(0)
+    model = DAGRouterModel()
+    set_leaf_probs(model, "leaf1", {0: 0.49, 1: 0.49})  # leaf1 knows classes 0 and 1
+    loader, x, y = banded_loader(THIRDS)
+    val, _, _ = banded_loader(THIRDS, seed=1)
+    new, info = cluster_split(model, "leaf0", loader, "cpu", noise=1e-4, max_k=3,
+                              link_policy="loss", val_loader=val)
+    assert info["k"] == 3 and info["policy"] == "cluster"
+    assert len(info["links"]) == 2 and {v["leaf"] for v in info["links"].values()} == {"leaf1"}
+    assert len(new) == 1 and model.graph.children("leaf0") == [new[0], "leaf1"]
+    (fresh_group,) = {"0", "1", "2"} - set(info["links"])
+    reach = info["cluster_reach"]
+    share = reach[int(fresh_group)] / sum(reach)
+    assert model.graph.targets["leaf0"] == pytest.approx([share, 1 - share])
+    model.eval()
+    with torch.no_grad():
+        route = model.route(x)["log_route"]["leaf0"].exp()
+    assert route.shape == (96, 2)
+    assert route[y == 2, 0].mean() > 0.9 and route[y < 2, 1].mean() > 0.9
+
+
+def test_link_policy_none_or_no_link_leaves_the_split_unchanged():
+    from beamroot.growth import cluster_split
+    loader, _, _ = banded_loader(HALVES)
+    results = []
+    for kwargs in ({}, {"link_policy": "loss", "val_loader": banded_loader(HALVES, seed=1)[0]}):
+        torch.manual_seed(0)
+        model = DAGRouterModel()
+        new, info = cluster_split(model, "leaf0", loader, "cpu", **kwargs)
+        results.append((new, info, model.graph.to_dict()))
+    # weights differ: iterating the validation loader draws from the global RNG
+    (new0, info0, g0), (new1, info1, g1) = results
+    assert "links" not in info0 and info1.pop("links") == {}
+    assert set(info1.pop("link_ratios")) == {"0", "1"}
+    info0.pop("router_pretrain_loss"), info1.pop("router_pretrain_loss")
+    assert new0 == new1 and info0 == info1 and g0["edges"] == g1["edges"]
+    assert g0["targets"] == pytest.approx(g1["targets"])
+
+
+def test_grow_with_loss_links_logs_links_and_flow_shows_the_shared_leaf(tmp_path):
+    from beamroot.analysis import class_flow, collect_stats
+    from beamroot.growth import grow
+    torch.manual_seed(0)
+    model = DAGRouterModel()
+    with torch.no_grad():  # root sends everything to leaf0, the worst leaf
+        model.nodes["root"].out.weight.zero_()
+        model.nodes["root"].out.bias.copy_(torch.tensor([0.0, -1e4]))
+    set_leaf_probs(model, "leaf1", {0: 0.99})
+    loader, _, _ = banded_loader(HALVES)
+    val, _, _ = banded_loader(HALVES, seed=1)
+    ev = grow(model, loader, "cpu", 1, tmp_path, max_nodes=9, max_k=4, policy="class",
+              link_policy="loss", val_loader=val)
+    assert ev["split"] == "leaf0" and ev["links"]["0"]["leaf"] == "leaf1"
+    assert ev["new_nodes"] == [n for n in model.graph.children("leaf0") if n != "leaf1"]
+    assert ev["num_nodes"] == 4
+    line = json.loads((tmp_path / "growth.jsonl").read_text().splitlines()[0])
+    assert line == ev
+    stats = collect_stats(model, loader, "cpu", 10)
+    assert "(shared, see above)" in class_flow(model.graph, stats["class_mass"])
+
+
+def test_link_policy_flag_defaults_from_preset_and_reaches_growth(tmp_path):
+    from beamroot.train import PRESETS, parse_args, run
+    assert all(p["link_policy"] == "none" for p in PRESETS.values())
+    assert parse_args([]).link_policy == "none"
+    assert parse_args(["--preset", "pure"]).link_policy == "none"
+    assert parse_args(["--link-policy", "loss"]).link_policy == "loss"
+    base = ["--dataset", "synthetic", "--model", "dag", "--device", "cpu", "--epochs", "2",
+            "--max-nodes", "9", "--link-policy", "loss", "--runs-dir", str(tmp_path)]
+    with pytest.raises(SystemExit):
+        run(parse_args(base + ["--val-size", "0"]))
+    res = run(parse_args(base))
+    ev = json.loads((res["run_dir"] / "growth.jsonl").read_text().splitlines()[0])
+    assert isinstance(ev["links"], dict)
+    assert ev["k"] == len(ev["new_nodes"]) + len(ev["links"])
+
+
+def test_choose_class_links_match_threshold_best_purity_and_fresh_rule():
+    from beamroot.growth import LINK_PURITY, choose_class_links
+    assert LINK_PURITY == 0.9
+    stats = {"a": (0, 0.95), "b": (1, 0.92)}
+    # match on class and purity; unmatched class does not link
+    assert choose_class_links([0, 2], stats) == {0: ("a", 0, 0.95)}
+    # purity just below 0.9 does not link; exactly 0.9 does
+    assert choose_class_links([0, 5], {"a": (0, 0.899)}) == {}
+    assert choose_class_links([0, 5], {"a": (0, 0.9)}) == {0: ("a", 0, 0.9)}
+    # two candidates of the same class: highest purity wins
+    got = choose_class_links([0, 5], {"a": (0, 0.93), "b": (0, 0.97)})
+    assert got == {0: ("b", 0, 0.97)}
+    # empty group never links; all would link -> lowest purity stays fresh
+    assert choose_class_links([None, 0], stats) == {1: ("a", 0, 0.95)}
+    assert choose_class_links([0, 1], stats) == {0: ("a", 0, 0.95)}
+
+
+def test_class_link_policy_links_group_to_pure_leaf_of_same_class():
+    from beamroot.growth import _pretrain_router, cluster_split
+    torch.manual_seed(0)
+    model = DAGRouterModel()
+    loader, x, y = banded_loader(THIRDS)
+    val, _, _ = banded_loader(THIRDS, seed=1)
+    # route class 0 half to leaf1 (so leaf1 only ever sees class 0), everything else to leaf0
+    with torch.no_grad():
+        f = model.stem(x).flatten(1)
+    c0 = y == 0
+    feats = torch.cat([f, f[c0]])
+    labels = torch.cat([torch.zeros_like(y), torch.ones_like(y[c0])])
+    w = torch.cat([torch.where(c0, 0.5, 1.0), torch.full((int(c0.sum()),), 0.5)])
+    _pretrain_router(model.nodes["root"], feats, labels, w, 300, 1e-2)
+    new, info = cluster_split(model, "leaf0", loader, "cpu", max_k=4, policy="class",
+                              link_policy="class", val_loader=val)
+    assert info["groups"] == [[0], [1], [2]]
+    assert list(info["links"]) == ["0"]
+    link = info["links"]["0"]
+    assert link["policy"] == "class" and link["leaf"] == "leaf1" and link["class"] == 0
+    assert link["purity"] >= 0.9 and "ratio" not in link
+    assert len(new) == 2 and model.graph.children("leaf0")[-1] == "leaf1"
+    assert info["link_candidates"] == {"0": {"leaf": "leaf1", "class": 0,
+                                             "purity": link["purity"]}}
+    assert set(model.nodes) == set(model.graph.nodes)
+    from beamroot.train import parse_args
+    assert parse_args(["--link-policy", "class"]).link_policy == "class"
+
+
+def test_link_scoring_leaves_training_rng_untouched(tmp_path):
+    from beamroot.train import parse_args, run
+    weights = {}
+    for policy in ("none", "loss", "class"):
+        res = run(parse_args(["--dataset", "synthetic", "--device", "cpu", "--epochs", "3",
+                              "--max-nodes", "7", "--link-policy", policy, "--no-report",
+                              "--runs-dir", str(tmp_path / policy)]))
+        events = [json.loads(s) for s in (res["run_dir"] / "growth.jsonl").read_text().splitlines()]
+        assert not any(e.get("links") for e in events)  # no link fires on this data
+        weights[policy] = torch.load(res["run_dir"] / "model.pt")["state_dict"]
+    base = weights["none"]
+    for policy in ("loss", "class"):
+        assert all(torch.equal(weights[policy][k], base[k]) for k in base)

@@ -63,3 +63,18 @@ def test_dict_round_trip_preserves_structure():
     assert g2.edges == g.edges
     assert {n: g2.parents(n) for n in g2.nodes} == {n: g.parents(n) for n in g.nodes}
     assert {n: v.kind for n, v in g2.nodes.items()} == {n: v.kind for n, v in g.nodes.items()}
+
+
+def test_split_with_a_link_gives_the_linked_leaf_a_second_parent():
+    g = diamond()
+    new = g.split("la", 1)
+    g.add_edge("la", "lb")  # the split's second group links to existing leaf lb
+    assert g.children("la") == [new[0], "lb"]
+    assert g.parents("lb") == ["b", "la"]
+    order = g.topological_order()
+    assert sorted(order) == sorted(g.nodes)
+    pos = {n: i for i, n in enumerate(order)}
+    assert all(pos[p] < pos[c] for p, c in g.edges)
+    g2 = RouterGraph.from_dict(g.to_dict())
+    assert g2.edges == g.edges and g2.parents("lb") == ["b", "la"]
+    assert g2.topological_order() == order

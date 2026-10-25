@@ -11,7 +11,7 @@
 - **K-way split** — A split with more than two children (up to `--max-k`). Not a chain of binary splits.
 - **Split policy** — How a split picks k and groups the leaf's images: `cluster` (k-means on hidden activations, k by silhouette; unsupervised) or `class` (one group per major class; uses labels).
 - **Growth preset** — A named bundle of growth defaults selected by `--preset`: `explainable` (unsupervised; k-way `cluster` splits, the default) or `pure` (supervised; k-way `class` splits). Explicit flags override it.
-- **Link** — A split child that is an existing leaf instead of a fresh one, so that leaf gains a parent. Made only at split time. Not a merge: the two leaves are not alike, and nothing is removed.
+- **Link** — A split child that is an existing leaf instead of a fresh one, so that leaf gains a parent. Made only at split time; split groups that link to the same leaf share one router output. Not a merge: the two leaves are not alike, and nothing is removed.
 - **Link policy** — When a split group links to an existing leaf: `none`, `loss` (the leaf already predicts the group's validation images well) or `class` (the leaf is pure in the group's dominant class).
 - **Class flow** — Text tree of the router graph showing which classes reach each node and with what reach. Written to `flow.txt` and the report.
 - **Merge** — Joining two behaviourally near-identical nodes into one that keeps both sets of parents.

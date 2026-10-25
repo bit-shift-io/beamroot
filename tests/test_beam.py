@@ -174,3 +174,18 @@ def test_predict_cli_prints_top_n_paths_per_sample(tmp_path, capsys):
             assert " -> ".join(p.nodes) in out
             assert f"{p.prob:.4f}" in out
             assert f"class {p.pred}" in out
+
+
+def test_beam_and_soft_routing_agree_over_a_linked_leaf():
+    g = tree()
+    (fresh,) = g.split("l0", 1)
+    g.add_edge("l0", "l2")  # l0's second group linked to l2, which now has two parents
+    torch.manual_seed(0)
+    model = DAGRouterModel(graph=g).eval()
+    x = torch.randn(6, 1, 28, 28)
+    out = model.route(x)
+    reach = torch.stack([out["log_reach"][n].exp() for n in g.leaves()]).sum(0)
+    assert torch.allclose(reach, torch.ones(6), atol=1e-5)
+    soft = model(x).exp()
+    results = beam_search(model, x, beam=len(g.leaves()))
+    assert torch.allclose(torch.stack([r.probs for r in results]), soft, atol=1e-5)
