@@ -41,11 +41,15 @@ def layout(graph) -> dict[str, tuple[float, float]]:
     return pos
 
 
-def node_labels(graph, class_mass, groups=None) -> dict[str, str]:
+def node_labels(graph, class_mass, groups=None, steps=None, leaf_top=None) -> dict[str, str]:
     labels = {}
     for name in graph.nodes:
         dom, pur = purity(class_mass[name], groups)
         labels[name] = f"{name}\n{'-' if dom is None else dom} {pur:.0%}"
+        if steps:
+            labels[name] += f" s{steps[name]}"
+        if leaf_top and name in leaf_top:
+            labels[name] += f"\ntop {leaf_top[name]}"
         if len(graph.parents(name)) > 1:
             labels[name] += "\nmerged: " + "+".join(graph.parents(name))
     return labels
@@ -158,7 +162,10 @@ def render_report(run_dir, device=None, samples=8, beam=3, beams=(1, 3, 5),
 
     rows = evaluate_modes(model, test_loader, device, beams, limit_batches)
     stats = collect_stats(model, test_loader, device, model.num_classes, limit_batches)
-    labels = node_labels(graph, stats["class_mass"], groups)
+    steps = getattr(model, "steps", None)  # cascade only
+    leaf_top = {n: int(m.logits.argmax()) for n, m in model.nodes.items()
+                if hasattr(m, "logits")} if steps else None
+    labels = node_labels(graph, stats["class_mass"], groups, steps, leaf_top)
     purity_rows = [{"node": n, "kind": graph.nodes[n].kind, "parents": graph.parents(n),
                     "merged": len(graph.parents(n)) > 1,
                     "class": purity(stats["class_mass"][n])[0],
@@ -166,7 +173,8 @@ def render_report(run_dir, device=None, samples=8, beam=3, beams=(1, 3, 5),
                     "group": purity(stats["class_mass"][n], groups)[0] if groups else None,
                     "group_purity": purity(stats["class_mass"][n], groups)[1]}
                    for n in graph.topological_order()]
-    flow = class_flow(graph, stats["class_mass"], dataset_info(config["dataset"]).get("classes"))
+    flow = class_flow(graph, stats["class_mass"], dataset_info(config["dataset"]).get("classes"),
+                      steps)
     (run_dir / "flow.txt").write_text(flow + "\n")
     baseline_ctx = baseline_summary(baseline) if baseline else None
     graph_png = draw_graph(graph, stats["edge_prob"], labels, run_dir / "graph.png")

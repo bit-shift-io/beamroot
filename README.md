@@ -132,6 +132,8 @@ Runs the `default` grid: every dataset in the grid × every seed, each as `train
 
 A grid entry in `GRIDS` may add `"variants": {name: [train flags]}` (e.g. `["--max-nodes", "19"]`). Each variant runs for every dataset × seed, run directories get the variant as a suffix, and the summary groups by dataset × variant with an extra `variant` column. Grids without variants (like `default`) are unchanged.
 
+A variant's flags may set `--model`; without it the runner uses `--model dag --merge`. The `cascade` grid (experiment 0004) runs 7 variants: `dag` (explainable preset) and `--model cascade` × `--size-axis {resolution,hidden,both}` × `--leaf {classifier,label}`, all with `--max-nodes 19`, seed 0, MNIST 12 epochs and CIFAR-10 15 epochs. Cascade variants pass `--start-step 1` (the `START_STEP` constant in `beamroot/experiment.py`), since at the default step 4 every size check is at its maximum and nothing bumps. The cascade-only flags (`--leaf`, `--size-axis`, `--prune-reach`, `--silhouette-min`, `--entropy-max`, `--spread-min`, `--purity-check`, `--purity-gain`) are rejected on other models. The summary adds beam-1 MACs, beam-1 ms/image, bumps, mean node step and train node evaluations per image (columns show – for runs that lack them).
+
 Flags:
 
 - `grid {default}` positional: the grid to run. `default` is datasets mnist and cifar10 × seeds 0, 1, 2.

@@ -91,3 +91,25 @@ def test_report_shows_baseline_row_and_group_purity(tmp_path):
     html = (dag / "report.html").read_text()
     assert "baseline (" in html and f"{base['test_acc']:.4f}" in html
     assert "group purity" in html and ("animal" in html or "vehicle" in html)
+
+
+def test_node_labels_and_flow_show_steps_and_label_leaf_class():
+    from beamroot.analysis import class_flow
+    g = balanced_tree(1)
+    mass = {"n0": [6.0, 2.0], "n1": [3.0, 1.0], "n2": [0.0, 1.0]}
+    labels = node_labels(g, mass, steps={"n0": 4, "n1": 2, "n2": 1}, leaf_top={"n1": 1})
+    assert "s2" in labels["n1"] and "top 1" in labels["n1"]
+    assert "top" not in labels["n2"]
+    flow = class_flow(g, mass, steps={"n0": 4, "n1": 2, "n2": 1}).splitlines()
+    assert flow[1].endswith("  s2") and flow[0].endswith("  s4")
+    assert class_flow(g, mass) == class_flow(g, mass, steps=None)
+    assert "s2" not in class_flow(g, mass)
+
+
+def test_cascade_run_writes_report_and_flow_with_steps(tmp_path):
+    for leaf in ("classifier", "label"):
+        out = run(parse_args(["--dataset", "synthetic", "--model", "cascade", "--device", "cpu",
+                              "--epochs", "2", "--limit-batches", "2", "--leaf", leaf,
+                              "--runs-dir", str(tmp_path / leaf)]))["run_dir"]
+        assert (out / "report.html").exists() and (out / "graph.png").exists()
+        assert " s" in (out / "flow.txt").read_text().splitlines()[0]

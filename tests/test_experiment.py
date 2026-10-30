@@ -184,3 +184,47 @@ def test_rows_follow_dataset_order_with_mean_and_std(tmp_path):
     assert rows[0]["beam1_acc"]["std"] == pytest.approx(0.0141421, abs=1e-6)
     lines = experiment.format_table(rows).splitlines()
     assert lines[2].startswith("| mnist | 2 | 0.9100 ± 0.0141 |")
+
+
+def test_run_metrics_reads_cost_bump_and_step_fields(tmp_path):
+    run = fake_run(tmp_path / "run", split_extra={"bump": {"check": "silhouette", "from": 1,
+                                                          "to": 2, "value": 0.05}})
+    with open(run / "growth.jsonl", "a") as f:
+        f.write(json.dumps({"epoch": 3, "bump": "r1", "check": "entropy", "from": 2, "to": 3,
+                            "value": 0.9}) + "\n")
+        f.write(json.dumps({"epoch": 3, "bump": "r2", "check": "spread", "at_max": True,
+                            "value": 0.0}) + "\n")
+    write_jsonl(run / "metrics.jsonl", [{"epoch": 1, "node_evals": 4.0},
+                                        {"epoch": 2, "node_evals": 2.0}])
+    rows = json.loads((run / "eval.json").read_text())
+    rows[0].update(mean_macs=1000.0, ms_per_image=1.5)
+    (run / "eval.json").write_text(json.dumps(rows))
+    extra = json.loads((run / "experiment.json").read_text())
+    (run / "experiment.json").write_text(json.dumps({**extra, "mean_step": 2.5}))
+    m = experiment.run_metrics(run)
+    assert (m["beam1_macs"], m["beam1_ms"], m["bumps"], m["mean_step"], m["train_evals"]) == (
+        1000.0, 1.5, 2, 2.5, 3.0)
+
+
+def test_run_metrics_old_run_without_cost_fields(tmp_path):
+    m = experiment.run_metrics(fake_run(tmp_path / "run"))
+    assert (m["beam1_macs"], m["beam1_ms"], m["bumps"], m["mean_step"], m["train_evals"]) == (
+        None, None, 0, None, None)
+
+
+def test_cascade_grid_variants_build_per_variant_flags():
+    variants = experiment.GRIDS["cascade"]["variants"]
+    assert len(variants) == 7
+    assert "--merge" not in sum((v for k, v in variants.items() if k != "dag"), [])
+    assert variants["dag"][:3] == ["--model", "dag", "--merge"]
+    flags = variants["hidden-label"]
+    assert flags[flags.index("--model") + 1] == "cascade"
+    assert flags[flags.index("--start-step") + 1] == str(experiment.START_STEP)
+    assert experiment.START_STEP < 4
+
+
+def test_cascade_grid_smoke_runs_all_variants(tmp_path):
+    exp = experiment.main(["cascade", "--datasets", "synthetic", "--epochs", "2", "--device", "cpu",
+                           "--limit-batches", "2", "--runs-dir", str(tmp_path)])
+    summary = json.loads((exp / "summary.json").read_text())
+    assert {r["variant"] for r in summary["runs"]} == set(experiment.GRIDS["cascade"]["variants"])

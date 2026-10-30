@@ -70,12 +70,13 @@ def collect_stats(model, loader, device, num_classes, limit_batches=None) -> dic
             "entropy": {r: e / count for r, e in ent_sum.items()}}
 
 
-def class_flow(graph, class_mass, class_names=None) -> str:
+def class_flow(graph, class_mass, class_names=None, steps=None) -> str:
     """Text tree of which classes reach each node, with reach (node mass / root mass).
 
     Routers list classes with >= 10% of that class's root mass reaching them; leaves list
     classes with >= 5% of their own mass and are marked pure at >= 95%. A node met under a
-    second parent prints one "(shared, see above)" line and no subtree.
+    second parent prints one "(shared, see above)" line and no subtree. `steps` (cascade
+    node -> size step) appends "  s<step>" to each node line.
     """
     root = graph.topological_order()[0]
     name = (lambda c: str(class_names[c])) if class_names else str
@@ -87,20 +88,21 @@ def class_flow(graph, class_mass, class_names=None) -> str:
         total = sum(mass)
         reach = total / root_total if root_total > 0 else 0.0
         head = f"{n}  reach {reach * 100:.0f}%"
+        tail = f"  s{steps[n]}" if steps else ""
         if n == root:
-            return f"{head}  {{all classes}}"
+            return f"{head}  {{all classes}}{tail}"
         if graph.nodes[n].kind == "router":
             share = {c: m / root_mass[c] for c, m in enumerate(mass) if root_mass[c] > 0}
             kept = sorted((c for c, s in share.items() if s >= 0.1 - 1e-12),
                           key=lambda c: -share[c])
-            return f"{head}  {{{','.join(name(c) for c in kept)}}}"
+            return f"{head}  {{{','.join(name(c) for c in kept)}}}{tail}"
         if total <= 0:
-            return head
+            return head + tail
         parts = [f"{name(c)} ({m / total * 100:.0f}%)"
                  for c, m in sorted(enumerate(mass), key=lambda cm: -cm[1])
                  if m / total >= 0.05 - 1e-12]
         pure = "  ← pure" if max(mass) / total >= 0.95 - 1e-12 else ""
-        return f"{head}  {', '.join(parts)}{pure}"
+        return f"{head}  {', '.join(parts)}{pure}{tail}"
 
     lines, seen = [describe(root)], {root}
 

@@ -23,6 +23,7 @@ from beamroot import train
 # Grids without variants run each dataset × seed once and show no variant column.
 # "epochs": {dataset: n} overrides the dataset's default epochs (--epochs overrides both).
 _SPLIT_FLAGS = ["--max-nodes", "19"]
+START_STEP = 1
 GRIDS = {
     "default": {"datasets": ["mnist", "cifar10"], "seeds": [0, 1, 2]},
     # Experiment 0002: split policies.
@@ -38,13 +39,26 @@ GRIDS = {
               "variants": {policy: [*_SPLIT_FLAGS, "--preset", "explainable",
                                     "--link-policy", policy]
                            for policy in ("none", "loss", "class")}},
+    # Experiment 0004: cascade sizing vs the explainable dag. START_STEP is low so the size
+    # checks can actually bump (at the default step 4 every check is at_max).
+    "cascade": {"datasets": ["mnist", "cifar10"], "seeds": [0],
+                "epochs": {"mnist": 12, "cifar10": 15},
+                "variants": {
+                    "dag": ["--model", "dag", "--merge", *_SPLIT_FLAGS, "--preset", "explainable"],
+                    **{f"{axis}-{leaf}": ["--model", "cascade", *_SPLIT_FLAGS,
+                                          "--start-step", str(START_STEP),
+                                          "--size-axis", axis, "--leaf", leaf]
+                       for axis in ("resolution", "hidden", "both")
+                       for leaf in ("classifier", "label")}}},
 }
 METRICS = ["beam1_acc", "beam3_acc", "soft_acc", "gap", "leaves", "mean_k", "links",
            "beam1_nodes", "split_router_entropy", "leaf_purity", "merges",
-           "closest_merge_kl", "train_minutes"]
+           "closest_merge_kl", "train_minutes", "beam1_macs", "beam1_ms", "bumps", "mean_step",
+           "train_evals"]
 HEADERS = ["beam-1 acc", "beam-3 acc", "soft acc", "soft − beam-1", "leaves", "mean k",
            "links", "beam-1 nodes", "split-router entropy", "leaf purity",
-           "merges", "closest merge KL", "train min"]
+           "merges", "closest merge KL", "train min", "beam-1 MACs", "beam-1 ms/image",
+           "bumps", "mean node step", "train node evals/image"]
 
 
 def _jsonl(path: Path) -> list[dict]:
@@ -69,8 +83,12 @@ def run_metrics(run_dir) -> dict:
     rows = {r["mode"]: r["accuracy"] for r in evaluated}
     nodes = {r["mode"]: r.get("mean_nodes") for r in evaluated}
     extra = json.loads((run_dir / "experiment.json").read_text())
-    merges, kls, ks, links = 0, [], [], 0
+    beam1_row = next((r for r in evaluated if r["mode"] == "beam 1"), {})
+    evals = [e["node_evals"] for e in _jsonl(run_dir / "metrics.jsonl") if "node_evals" in e]
+    merges, kls, ks, links, bumps = 0, [], [], 0, 0
     for event in _jsonl(run_dir / "growth.jsonl"):
+        # a router-check line has "bump": name; a split event's size check has "bump": {...}
+        bumps += "bump" in event and ("to" in event or "to" in event["bump"])
         if "split" in event:  # k and links are absent from binary, link-free runs
             ks.append(event.get("k", 2))
             links += _count(event.get("links", 0))
@@ -97,6 +115,11 @@ def run_metrics(run_dir) -> dict:
         "merges": merges,
         "closest_merge_kl": min(kls) if kls else None,
         "train_minutes": extra["train_minutes"],
+        "beam1_macs": beam1_row.get("mean_macs"),
+        "beam1_ms": beam1_row.get("ms_per_image"),
+        "bumps": bumps,
+        "mean_step": extra.get("mean_step"),
+        "train_evals": _mean_or_none(evals),
     }
 
 
@@ -128,6 +151,7 @@ def measure(run_dir: Path, device, limit_batches=None, train_minutes: float = 0.
     (run_dir / "experiment.json").write_text(json.dumps({
         "train_minutes": train_minutes,
         "leaves": len(leaves),
+        **({"mean_step": mean(model.steps.values())} if hasattr(model, "steps") else {}),
         "router_entropy": stats["entropy"],
         "leaf_purity": {n: purity(stats["class_mass"][n])[1] for n in leaves}}, indent=2))
     (run_dir / "eval.json").write_text(json.dumps(rows, indent=2))
@@ -161,7 +185,8 @@ def _cell(s: dict, digits: int) -> str:
 
 def format_table(rows: list[dict]) -> str:
     digits = {"merges": 1, "train_minutes": 1, "leaves": 1, "mean_k": 2, "links": 1,
-              "beam1_nodes": 2}
+              "beam1_nodes": 2, "beam1_macs": 0, "beam1_ms": 2, "bumps": 1,
+              "mean_step": 2, "train_evals": 2}
     with_variant = any(r.get("variant") for r in rows)
     head = ["dataset"] + (["variant"] if with_variant else []) + ["n"] + HEADERS
     lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
@@ -207,10 +232,12 @@ def main(argv=None) -> Path:
         run_dir = finished_run(exp_dir, name)
         if run_dir is None:
             print(f"== {name}", flush=True)
-            argv = ["--model", "dag", "--merge", "--dataset", dataset, "--seed", str(seed),
+            flags = args.variants[variant]
+            argv = [] if "--model" in flags else ["--model", "dag", "--merge"]
+            argv += ["--dataset", dataset, "--seed", str(seed),
                     "--name", name,
                     "--runs-dir", str(exp_dir)]
-            argv += args.variants[variant]
+            argv += flags
             argv += [] if args.report else ["--no-report"]
             epochs = args.epochs if args.epochs is not None else args.grid_epochs.get(dataset)
             for flag, value in [("--device", args.device), ("--epochs", epochs),

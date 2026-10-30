@@ -30,5 +30,9 @@ class Leaf(nn.Module):
             nn.Linear(hidden, num_classes),
         )
 
+    def hidden(self, feats: torch.Tensor) -> torch.Tensor:
+        """Activations after the ReLU (what split clustering reads)."""
+        return self.net[:2](feats)
+
     def forward(self, feats: torch.Tensor) -> torch.Tensor:
         return self.net(feats)

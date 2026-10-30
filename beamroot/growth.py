@@ -1,6 +1,7 @@
 """Growth steps: split the worst leaf of a DAG router model (see CONTEXT.md: Growth step, Split)."""
 import copy
 import json
+import math
 from itertools import islice
 from pathlib import Path
 
@@ -34,6 +35,13 @@ def choose_leaf(losses: dict[str, float]) -> str:
     return max(losses, key=losses.get)
 
 
+def _set_steps(model, name: str, new) -> None:
+    """Cascade only: new nodes take the split leaf's size step (before `build_node`)."""
+    if hasattr(model, "steps"):
+        for n in new:
+            model.steps[n] = model.steps[name]
+
+
 def split_leaf(model, name: str, noise: float = 1e-3) -> tuple[str, str]:
     """Copy split of leaf `name` of a DAGRouterModel, in place: `cluster_split`'s
     fallback when the leaf's images do not form two groups.
@@ -45,8 +53,12 @@ def split_leaf(model, name: str, noise: float = 1e-3) -> tuple[str, str]:
     old = model.nodes[name]
     ref = next(old.parameters())
     new = model.graph.split(name)
+    _set_steps(model, name, new)
     model.nodes[name] = model.build_node(name).to(ref.device)
     for n in new:
+        if hasattr(model, "steps"):  # cascade: random leaves at the parent's step, no copy
+            model.nodes[n] = model.build_node(n).to(ref.device)
+            continue
         leaf = copy.deepcopy(old)
         with torch.no_grad():
             for p in leaf.parameters():
@@ -237,7 +249,7 @@ def _val_class_mass(model, name, loader, device, limit_batches, assign, k):
             if gm is None:
                 gm = torch.zeros(k, c, device=device)
                 lm = {n: torch.zeros(c, device=device) for n in leaves}
-            g = assign(model.nodes[name].net[:2](model.stem(x).flatten(1)), y)
+            g = assign(model.nodes[name].hidden(model.features(x)), y)
             r = out["log_reach"][name].exp()
             for i in range(k):
                 gm[i].index_add_(0, y[g == i], r[g == i])
@@ -247,20 +259,35 @@ def _val_class_mass(model, name, loader, device, limit_batches, assign, k):
     return gm.tolist(), {n: v.tolist() for n, v in lm.items()}
 
 
+def _view_parent(model, name, out) -> str:
+    """The parent router of label leaf `name` sending it the most reach (on this batch)."""
+    def sent(p):
+        i = model.graph.children(p).index(name)
+        return (out["log_reach"][p] + out["log_route"][p][:, i]).exp().sum().item()
+    return max(model.graph.parents(name), key=sent)
+
+
 def _leaf_inputs(model, name, loader, device, limit_batches):
     """(stem features, hidden activations of leaf `name`, reach of `name`, labels) over
     the loader's batches, in eval mode (no dropout) and without gradients."""
     was_training = model.training
     model.eval()
     feats, hidden, reach, ys = [], [], [], []
+    parent = None
     with torch.no_grad():
         for x, y in islice(loader, limit_batches):
             ys.append(y.to(device))
             x = x.to(device)
-            f = model.stem(x).flatten(1)
+            f = model.features(x)
             feats.append(f)
-            hidden.append(model.nodes[name].net[:2](f))  # output of the ReLU
-            reach.append(model.route(x)["log_reach"][name].exp())
+            out = model.route(x)
+            if hasattr(model.nodes[name], "hidden"):
+                hidden.append(model.nodes[name].hidden(f))  # output of the ReLU
+            else:  # label leaf: the highest-reach parent router's view
+                if parent is None:
+                    parent = _view_parent(model, name, out)
+                hidden.append(model.nodes[parent].hidden(f))
+            reach.append(out["log_reach"][name].exp())
     model.train(was_training)
     return torch.cat(feats), torch.cat(hidden), torch.cat(reach), torch.cat(ys)
 
@@ -297,11 +324,97 @@ def _pretrain_router(router, feats, labels, w, steps: int, lr: float) -> float:
         return loss_fn().item()
 
 
+MAX_STEP = 4
+
+
+def _size_check(model, name: str, scores: dict, sizes: list, minimum: float,
+                purity=None) -> dict:
+    """Cascade size check (i): a poorly separated split (best silhouette < `minimum`, or an
+    empty group) bumps the router and its new children one step above the split leaf.
+    `purity` = (gain, minimum) optionally adds the purity check: it fails when the gain is
+    <= the minimum. Either failure gives one bump; the record lists every check that ran
+    (`check` is the first failing one, a purity check is also logged as `purity`).
+    Sets `model.steps[name]` so the router is built at the bumped step; returns the event record.
+    """
+    if not scores and purity is None:
+        return {"check": "skipped"}
+    rec = {}
+    sil_fail = False
+    if scores:
+        rec = {"check": "silhouette", "value": max(scores.values())}
+        sil_fail = rec["value"] < minimum or min(sizes) == 0
+    pur_fail = False
+    if purity is not None:
+        gain, pmin = purity
+        pur_fail = gain <= pmin
+        entry = {"check": "purity", "value": gain}
+        if rec:
+            rec["purity"] = entry
+        else:
+            rec = dict(entry)
+    if not (sil_fail or pur_fail):
+        return {**rec, "bumped": False}
+    if pur_fail and not sil_fail and scores:
+        rec["check"] = "purity"
+        rec["value"], rec["silhouette"] = rec["purity"]["value"], rec["value"]
+    s = model.steps[name]
+    if s >= MAX_STEP:
+        return {**rec, "at_max": True}
+    model.steps[name] = s + 1
+    return {**rec, "from": s, "to": s + 1}
+
+
+def _purity_gain(ys, reach, labels, k, num_classes) -> float:
+    """Reach-weighted purity of the k groups minus the leaf's own purity (class mass)."""
+    from beamroot.analysis import purity
+    mass = torch.zeros(k, num_classes, dtype=torch.float64)
+    for g in range(k):
+        sel = labels == g
+        mass[g].index_add_(0, ys[sel].cpu(), reach[sel].cpu().double())
+    total = mass.sum()
+    if total <= 0:
+        return 0.0
+    leaf = purity(mass.sum(0).tolist())[1]
+    groups = sum(purity(m.tolist())[1] * float(m.sum()) for m in mass) / float(total)
+    return groups - leaf
+
+
+def size_checks(model, stats: dict, entropy_max: float, spread_min: float, device) -> list[dict]:
+    """Cascade size checks (ii) and (iv) on last epoch's router `stats` ({router: usage, entropy}).
+
+    A router whose entropy exceeds `entropy_max` * ln k, or whose smallest child usage is below
+    `spread_min` * 2 / k, is rebuilt fresh one step up (same children and balance target).
+    At `MAX_STEP` it is left alone. Returns the bump records; the caller rebuilds the optimiser.
+    """
+    records = []
+    for name, s in stats.items():
+        if name not in model.nodes or model.graph.nodes[name].kind != "router":
+            continue
+        k = len(s["usage"])
+        if s["entropy"] > entropy_max * math.log(k):
+            check, value = "entropy", s["entropy"]
+        elif min(s["usage"]) < spread_min * 2 / k:
+            check, value = "spread", min(s["usage"])
+        else:
+            continue
+        step = model.steps[name]
+        if step >= MAX_STEP:
+            records.append({"bump": name, "check": check, "at_max": True, "value": value})
+            continue
+        model.steps[name] = step + 1
+        ref = next(model.nodes[name].parameters())
+        model.nodes[name] = model.build_node(name).to(ref.device)
+        records.append({"bump": name, "check": check, "from": step, "to": step + 1,
+                        "value": value})
+    return records
+
+
 def cluster_split(model, name: str, loader, device, noise: float = 1e-3,
                   limit_batches=None, pretrain_steps: int = 100,
                   pretrain_lr: float = 1e-2, max_k: int = 2,
                   policy: str = "cluster", link_policy: str = "none",
-                  val_loader=None) -> tuple[tuple[str, ...], dict]:
+                  val_loader=None, silhouette_min=None,
+                  purity_gain=None) -> tuple[tuple[str, ...], dict]:
     """Split leaf `name` with cluster initialisation (see CONTEXT.md: Split initialisation).
 
     The leaf's images (the loader's first `limit_batches` batches) are split into k
@@ -345,6 +458,11 @@ def cluster_split(model, name: str, loader, device, noise: float = 1e-3,
             "cluster_reach": [float(reach[labels == c].sum()) for c in range(k)],
             "router_pretrain_loss": None, "fallback": None,
             "k": k, "silhouettes": {str(c): v for c, v in scores.items()}, **extra}
+    if silhouette_min is not None and hasattr(model, "steps"):
+        pur = None
+        if purity_gain is not None:  # labels (training batches) are read only for this check
+            pur = (_purity_gain(ys, reach, labels, k, int(ys.max()) + 1), purity_gain)
+        info["bump"] = _size_check(model, name, scores, sizes, silhouette_min, pur)
     if min(sizes) == 0:
         info["fallback"] = "copy"
         return split_leaf(model, name, noise), info
@@ -384,6 +502,7 @@ def cluster_split(model, name: str, loader, device, noise: float = 1e-3,
     fresh_groups = [g for g in range(k) if g not in links]
     linked = list(dict.fromkeys(links[g][0] for g in sorted(links)))
     new = model.graph.split(name, len(fresh_groups))
+    _set_steps(model, name, new)
     for leaf in linked:
         model.graph.add_edge(name, leaf)
     column = {g: i for i, g in enumerate(fresh_groups)}  # group -> router output
@@ -391,7 +510,8 @@ def cluster_split(model, name: str, loader, device, noise: float = 1e-3,
     model.nodes[name] = model.build_node(name).to(feats.device)
     for n, g in zip(new, fresh_groups):
         fresh = model.build_node(n).to(feats.device)
-        model.nodes[n] = _masked_leaf(old, fresh, masks[g], noise)
+        model.nodes[n] = (fresh if hasattr(model, "steps")
+                          else _masked_leaf(old, fresh, masks[g], noise))
     outputs = torch.tensor([column[g] for g in range(k)], device=labels.device)[labels]
     info["router_pretrain_loss"] = _pretrain_router(
         model.nodes[name], feats, outputs, reach, pretrain_steps, pretrain_lr)
@@ -440,7 +560,7 @@ def _val_group_losses(model, name, loader, device, limit_batches, assign, k):
         for x, y in islice(loader, limit_batches):
             x, y = x.to(device), y.to(device)
             out = model.route(x)
-            groups.append(assign(model.nodes[name].net[:2](model.stem(x).flatten(1)), y))
+            groups.append(assign(model.nodes[name].hidden(model.features(x)), y))
             reach.append(out["log_reach"][name].exp())
             nll.append(torch.stack([-out["leaf_log_probs"][n].gather(1, y[:, None]).squeeze(1)
                                     for n in leaves], 1))
@@ -591,7 +711,7 @@ def save_graph_snapshot(model, run_dir, epoch: int) -> Path:
 def grow(model, loader, device, epoch: int, run_dir, max_nodes: int,
          limit_batches=None, noise: float = 1e-3, max_k: int = 2,
          policy: str = "cluster", link_policy: str = "none",
-         val_loader=None) -> dict | None:
+         val_loader=None, silhouette_min=None, purity_gain=None) -> dict | None:
     """One growth step: cluster-split the leaf with the highest reach-weighted loss
     (ADR 0003), clustering the same batches the loss is measured on.
 
@@ -610,9 +730,12 @@ def grow(model, loader, device, epoch: int, run_dir, max_nodes: int,
     target = choose_leaf(losses)
     new, info = cluster_split(model, target, loader, device, noise, limit_batches,
                              max_k=room, policy=policy, link_policy=link_policy,
-                             val_loader=val_loader)
+                             val_loader=val_loader, silhouette_min=silhouette_min,
+                             purity_gain=purity_gain)
     event = {"epoch": epoch, "split": target, "new_nodes": list(new),
              "num_nodes": len(model.graph.nodes), "leaf_losses": losses, **info}
+    if hasattr(model, "steps"):
+        event["steps"] = {n: model.steps[n] for n in new}
     with open(Path(run_dir) / "growth.jsonl", "a") as f:
         f.write(json.dumps(event) + "\n")
     save_graph_snapshot(model, run_dir, epoch)

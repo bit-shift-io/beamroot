@@ -1,8 +1,8 @@
 # Glossary
 
-- **Stem** — Shared conv layers every image passes through first. Not part of the router graph; never routed.
-- **Router node** — Small MLP in the router graph that outputs a probability per child. Has one or more parents.
-- **Leaf** — Graph node with no children; a small classifier head over the dataset's classes. Never routes.
+- **Stem** — Shared conv layers every image passes through first, in the `dag` model. Not part of the router graph; never routed. A cascade model has no shared stem: each node model has its own.
+- **Router node** — Node in the router graph that outputs a probability per child. Has one or more parents. In `dag` a small MLP over stem features; in cascade a node model.
+- **Leaf** — Graph node with no children; gives a class distribution. Never routes. A classifier leaf has a network; a label leaf does not.
 - **Router graph** — The DAG of router nodes and leaves above the stem. One root. Always acyclic.
 - **Path** — Sequence of nodes from root to a leaf. Its probability is the product of routing probabilities along it.
 - **Beam** — Inference that keeps the N most probable partial paths at each depth. Paths reaching the same node combine.
@@ -25,3 +25,13 @@
 - **Routing entropy** — Mean per-image entropy of a router's child probabilities. ln 2 for two children means undecided; near 0 means decisive. Not the same as usage balance.
 - **Validation set** — Training images held out by seed for structural decisions such as merges. The test set is for reporting only.
 - **Experiment log** — `docs/experiments/`: one permanent entry per experiment with variants, results, and the decision.
+- **Cascade model** — Model kind (`--model cascade`) where each node owns a node model sized by its size step. Not the `dag` model: no shared stem, no merges or links (ADR 0005).
+- **Node model** — A cascade node's own network: downsample the raw image, own conv stem, hidden layer, output. Reads the image, never a parent's output.
+- **Size step** — A cascade node's rung on the four-step size ladder (1 smallest, 4 = `dag` node size). The root starts at `--start-step`; children inherit their parent's step.
+- **Size axis** — Which dimensions follow the size step: `resolution` (image resolution and stem channels), `hidden` (hidden units) or `both`.
+- **Size check** — A test that a node can split its images: silhouette (at split), decisiveness and spread (after training), purity (optional, uses labels).
+- **Bump** — Rebuilding a node one size step up with fresh random weights after a failed size check. Not growing in place; trained weights are discarded.
+- **Spread** — Share of a router's images going to its least-used child. Low spread means images are not actually split, however decisive the router is. Not the same as routing entropy.
+- **Classifier leaf** — Leaf with its own network over its input (a `dag` leaf, or a sized cascade leaf).
+- **Label leaf** — Cascade leaf with no network: a learned class distribution, started near-uniform with small random logits so routers get a gradient. The routers do all the classifying.
+- **Pruned soft routing** — Cascade training where an image skips a node once its reach falls below `--prune-reach`. Not hard routing: every kept branch still gets its reach-weighted gradient.

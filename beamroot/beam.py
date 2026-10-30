@@ -11,7 +11,7 @@ evaluated and mixed, weighted by their renormalised probability.
 With merges, "the path" to a node is ambiguous: each result reports the
 highest-probability incoming path alongside the combined probability.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
@@ -31,6 +31,7 @@ class BeamResult:
     paths: list[BeamPath]   # descending by combined probability
     probs: torch.Tensor     # (C,) class distribution from the retained leaves
     nodes_evaluated: int
+    evaluated: list[str] = field(default_factory=list)  # names of evaluated nodes
 
     @property
     def pred(self) -> int:
@@ -51,7 +52,7 @@ def beam_search(model, x: torch.Tensor, beam: int) -> list[BeamResult]:
     graph = model.graph
     descendants = {n: graph.descendants(n) for n in graph.nodes}
     with torch.no_grad():
-        feats = model.stem(x).flatten(1)
+        feats = model.features(x)
         return [_search_one(model, feats[i:i + 1], beam, descendants)
                 for i in range(feats.shape[0])]
 
@@ -60,7 +61,7 @@ def _search_one(model, feats, beam, descendants) -> BeamResult:
     graph = model.graph
     root = graph.root
     frontier = {root: _Entry(1.0, [root], 1.0)}
-    evaluated = 0
+    evaluated = []
     while True:
         ready = [n for n in frontier if graph.nodes[n].kind == "router"
                  and not any(n in descendants[m] for m in frontier if m != n)]
@@ -69,7 +70,7 @@ def _search_one(model, feats, beam, descendants) -> BeamResult:
         for name in ready:
             entry = frontier.pop(name)
             route = model.nodes[name](feats)[0].exp().tolist()
-            evaluated += 1
+            evaluated.append(name)
             for child, p in zip(graph.children(name), route):
                 path_prob = entry.best_prob * p
                 if child not in frontier:
@@ -85,8 +86,8 @@ def _search_one(model, feats, beam, descendants) -> BeamResult:
     total = sum(e.prob for e in frontier.values())
     for leaf, entry in frontier.items():
         leaf_probs = F.softmax(model.nodes[leaf](feats)[0], dim=0)
-        evaluated += 1
+        evaluated.append(leaf)
         mix = mix + (entry.prob / total) * leaf_probs
         paths.append(BeamPath(leaf, entry.best_path, entry.prob, entry.best_prob,
                               int(leaf_probs.argmax())))
-    return BeamResult(paths, mix, evaluated)
+    return BeamResult(paths, mix, len(evaluated), evaluated)

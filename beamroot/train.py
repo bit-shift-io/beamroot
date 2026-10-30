@@ -8,9 +8,10 @@ import torch.nn.functional as F
 
 from beamroot.data import dataset_info, get_loaders
 from beamroot.device import select_device
-from beamroot.growth import grow, merge_step, rebuild_optimizer, save_graph_snapshot
+from beamroot.growth import _log_event, grow, merge_step, size_checks, rebuild_optimizer, save_graph_snapshot
 from beamroot.losses import balance_loss, path_loss, router_usage, routing_entropy
 from beamroot.models.baseline import BaselineCNN, count_params, match_width
+from beamroot.models.cascade import CascadeModel
 from beamroot.models.dag import DAGRouterModel
 from beamroot.runs import create_run_dir, log_metrics
 
@@ -42,6 +43,8 @@ def train_epoch(model, loader, opt, device, limit_batches=None, balance_weight=0
     and `parts` (a dict) with the mean "ce" (path loss) and "balance" components of the loss.
     """
     model.train()
+    if hasattr(model, "node_evals"):
+        model.node_evals = model.rows_seen = 0
     losses = []
     sums, steps = {}, 0
     ce_sum = bal_sum = 0.0
@@ -75,11 +78,14 @@ def train_epoch(model, loader, opt, device, limit_batches=None, balance_weight=0
             stats[name] = {"usage": (u / steps).tolist(), "entropy": float(e / steps)}
     if parts is not None and steps:
         parts.update({"ce": ce_sum / steps, "balance": bal_sum / steps})
+        if getattr(model, "rows_seen", 0):
+            parts["evals"] = model.node_evals / model.rows_seen
     return losses
 
 
 def build_model(name: str, dataset: str = "mnist", width: int | None = None,
-                hidden: int | None = None):
+                hidden: int | None = None, size_axis: str = "both", start_step: int = 4,
+                leaf: str = "classifier"):
     info = dataset_info(dataset)
     width = width or info["width"]
     dims = {"in_channels": info["channels"], "image_size": info["image_size"],
@@ -88,6 +94,8 @@ def build_model(name: str, dataset: str = "mnist", width: int | None = None,
         return BaselineCNN(**dims, **({"hidden": hidden} if hidden else {}))
     if name == "dag":
         return DAGRouterModel(**dims)
+    if name == "cascade":
+        return CascadeModel(**dims, size_axis=size_axis, start_step=start_step, leaf=leaf)
     raise ValueError(f"unknown model {name!r}")
 
 
@@ -107,6 +115,15 @@ def save_payload(model):
 
 
 def run(args) -> dict:
+    if args.model == "cascade":
+        if args.merge:
+            raise SystemExit("--merge does not apply to --model cascade")
+        if args.link_policy != "none":
+            raise SystemExit("--link-policy does not apply to --model cascade")
+    elif args.leaf != "classifier" or args.prune_reach != 0.01 or args.silhouette_min != 0.1 \
+            or args.entropy_max != 0.5 or args.spread_min != 0.1 \
+            or args.purity_check or args.purity_gain != 0.05:
+        raise SystemExit("--leaf, --prune-reach and --silhouette-min only apply to --model cascade")
     torch.manual_seed(args.seed)
     device = select_device(args.device)
     if args.merge and args.val_size == 0:
@@ -121,7 +138,10 @@ def run(args) -> dict:
         if args.model != "baseline":
             raise SystemExit("--match-params only applies to --model baseline")
         args.width, args.hidden = matched_size(args.match_params, args.dataset)
-    model = build_model(args.model, args.dataset, args.width, args.hidden).to(device)
+    model = build_model(args.model, args.dataset, args.width, args.hidden,
+                        args.size_axis, args.start_step, args.leaf).to(device)
+    if args.model == "cascade":
+        model.prune_reach = args.prune_reach
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     config = {**vars(args), "resolved_device": str(device), "params": count_params(model)}
     run_dir = create_run_dir(args.name or f"{args.dataset}-{args.model}", args.runs_dir, config)
@@ -142,6 +162,8 @@ def run(args) -> dict:
                 "test_acc": acc, "seconds": time.time() - t0}
         if parts:
             last["ce_loss"], last["balance_loss"] = parts["ce"], parts["balance"]
+        if "evals" in parts:
+            last["node_evals"] = parts["evals"]
         if stats:
             last["routing"] = stats
         if isinstance(model, DAGRouterModel):
@@ -163,12 +185,23 @@ def run(args) -> dict:
                           f"removed {m['removed']} ({m['num_nodes']} nodes)", flush=True)
                 if not merges:
                     print(f"  merge: no pair below sym KL {args.merge_threshold}", flush=True)
+            bumps = []
+            if args.model == "cascade":
+                bumps = size_checks(model, stats, args.entropy_max, args.spread_min, device)
+                for b in bumps:
+                    _log_event(run_dir, {"epoch": epoch, **b})
+                    print(f"  bump {b['bump']} ({b['check']} {b['value']:.3f})"
+                          + (" at max" if b.get("at_max") else f" {b['from']} -> {b['to']}"),
+                          flush=True)
             event = grow(model, train_loader, device, epoch, run_dir, args.max_nodes,
                          limit_batches=args.growth_batches, noise=args.split_noise,
                          max_k=args.max_k, policy=args.split_policy,
-                         link_policy=args.link_policy, val_loader=val_loader)
+                         link_policy=args.link_policy, val_loader=val_loader,
+                         silhouette_min=(args.silhouette_min if args.model == "cascade"
+                                         else None),
+                         purity_gain=(args.purity_gain if args.purity_check else None))
             fresh = event["new_nodes"] if event else []  # fresh leaves only, not linked ones
-            if event or merges:
+            if event or merges or any('to' in b for b in bumps):
                 opt = rebuild_optimizer(model, opt)
             if event:
                 print(f"  split {event['split']} -> {event['new_nodes']} (k {event['k']}) "
@@ -196,18 +229,43 @@ def run(args) -> dict:
             stats = collect_stats(model, test_loader, device, model.num_classes,
                                   args.limit_batches)
             print(class_flow(model.graph, stats["class_mass"],
-                             dataset_info(config["dataset"]).get("classes")), flush=True)
+                             dataset_info(config["dataset"]).get("classes"),
+                             getattr(model, "steps", None)), flush=True)
     return {"run_dir": run_dir, "first_loss": first_loss, **last}
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", default="mnist", choices=["mnist", "synthetic", "cifar10", "synthetic_cifar"])
-    p.add_argument("--model", default="dag", choices=["dag", "baseline"])
+    p.add_argument("--model", default="dag", choices=["dag", "baseline", "cascade"])
     p.add_argument("--device", default=None, help="mps or cpu (default: mps if available)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--epochs", type=int, default=None, help="default depends on the dataset")
     p.add_argument("--width", type=int, default=None, help="stem width (default depends on the dataset)")
+    p.add_argument("--size-axis", choices=["resolution", "hidden", "both"], default="both",
+                   help="cascade only: which dimensions follow the node size step")
+    p.add_argument("--start-step", type=int, default=4, choices=[1, 2, 3, 4],
+                   help="cascade only: the root's size step (4 = dag node size)")
+    p.add_argument("--prune-reach", type=float, default=0.01,
+                   help="cascade only: while training, a node runs only on images whose reach "
+                        "is at least this (0 = full soft routing)")
+    p.add_argument("--silhouette-min", type=float, default=0.1,
+                   help="cascade only: a split whose best silhouette is below this (or has an "
+                        "empty group) starts one size step higher (0 = never)")
+    p.add_argument("--purity-check", action="store_true",
+                   help="cascade only: a split whose groups are not purer than the leaf by "
+                        "--purity-gain starts one size step higher (uses training labels)")
+    p.add_argument("--purity-gain", type=float, default=0.05,
+                   help="cascade only: minimum purity gain for --purity-check")
+    p.add_argument("--entropy-max", type=float, default=0.5,
+                   help="cascade only: a router whose entropy exceeds this x ln k is rebuilt "
+                        "one size step up (1 = never)")
+    p.add_argument("--spread-min", type=float, default=0.1,
+                   help="cascade only: a router whose smallest child usage is below this x 2/k "
+                        "is rebuilt one size step up (0 = never)")
+    p.add_argument("--leaf", choices=["classifier", "label"], default="classifier",
+                   help="cascade only: classifier = a network per leaf; label = a learned "
+                        "class distribution with no network")
     p.add_argument("--hidden", type=int, default=None, help="baseline head hidden size (default 128)")
     p.add_argument("--match-params", default=None, metavar="RUN_DIR",
                    help="baseline only: size the CNN within 10%% of this DAG run's parameter count")

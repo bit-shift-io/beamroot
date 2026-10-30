@@ -44,6 +44,10 @@ class DAGRouterModel(nn.Module):
             return RouterNode(self.in_features, len(self.graph.children(name)))
         return Leaf(self.in_features, self.num_classes)
 
+    def features(self, x: torch.Tensor) -> torch.Tensor:
+        """What every node reads: flattened shared-stem features."""
+        return self.stem(x).flatten(1)
+
     def route(self, x: torch.Tensor) -> dict:
         """Soft forward over the whole graph, evaluating each node once.
 
@@ -53,7 +57,7 @@ class DAGRouterModel(nn.Module):
           leaf_log_probs: {leaf: (B, C)} each leaf's log class distribution
           log_probs:      (B, C) log of the reach-weighted leaf mixture
         """
-        feats = self.stem(x).flatten(1)
+        feats = self.features(x)
         order = self.graph.topological_order()
         incoming: dict[str, list[torch.Tensor]] = {n: [] for n in order}
         log_reach, log_route, leaf_log_probs = {}, {}, {}
