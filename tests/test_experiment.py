@@ -228,3 +228,21 @@ def test_cascade_grid_smoke_runs_all_variants(tmp_path):
                            "--limit-batches", "2", "--runs-dir", str(tmp_path)])
     summary = json.loads((exp / "summary.json").read_text())
     assert {r["variant"] for r in summary["runs"]} == set(experiment.GRIDS["cascade"]["variants"])
+
+
+def test_cascade29_grid_gives_every_variant_29_nodes():
+    variants = experiment.GRIDS["cascade29"]["variants"]
+    assert set(variants) == {"dag-29", "resolution-label-29", "hidden-label-29", "both-label-29"}
+    for flags in variants.values():
+        assert flags[flags.index("--max-nodes") + 1] == "29"
+    assert all("--merge" not in f for n, f in variants.items() if n != "dag-29")
+
+
+def test_cascadeinit_grid_variants():
+    variants = experiment.GRIDS["cascadeinit"]["variants"]
+    assert len(variants) == 6
+    for flags in variants.values():
+        assert flags[flags.index("--max-nodes") + 1] == "19"
+        assert "--leaf" in flags and flags[flags.index("--leaf") + 1] == "classifier"
+    copy = variants["both-classifier-copy-settle"]
+    assert "--leaf-init" in copy and "--settle-epochs" in copy and "--bump-cooldown" in copy

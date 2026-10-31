@@ -379,16 +379,20 @@ def _purity_gain(ys, reach, labels, k, num_classes) -> float:
     return groups - leaf
 
 
-def size_checks(model, stats: dict, entropy_max: float, spread_min: float, device) -> list[dict]:
+def size_checks(model, stats: dict, entropy_max: float, spread_min: float, device,
+                epoch: int = 0, cooldown: int = 0) -> list[dict]:
     """Cascade size checks (ii) and (iv) on last epoch's router `stats` ({router: usage, entropy}).
 
     A router whose entropy exceeds `entropy_max` * ln k, or whose smallest child usage is below
     `spread_min` * 2 / k, is rebuilt fresh one step up (same children and balance target).
-    At `MAX_STEP` it is left alone. Returns the bump records; the caller rebuilds the optimiser.
+    At `MAX_STEP` it is left alone. A router younger than `cooldown` epochs (since it was
+    created or last bumped, `model.last_change_epoch`) is skipped. Returns the bump records; the caller rebuilds the optimiser.
     """
     records = []
     for name, s in stats.items():
         if name not in model.nodes or model.graph.nodes[name].kind != "router":
+            continue
+        if cooldown and epoch - model.last_change_epoch.get(name, 0) < cooldown:
             continue
         k = len(s["usage"])
         if s["entropy"] > entropy_max * math.log(k):
@@ -404,6 +408,7 @@ def size_checks(model, stats: dict, entropy_max: float, spread_min: float, devic
         model.steps[name] = step + 1
         ref = next(model.nodes[name].parameters())
         model.nodes[name] = model.build_node(name).to(ref.device)
+        model.last_change_epoch[name] = epoch
         records.append({"bump": name, "check": check, "from": step, "to": step + 1,
                         "value": value})
     return records
@@ -414,7 +419,7 @@ def cluster_split(model, name: str, loader, device, noise: float = 1e-3,
                   pretrain_lr: float = 1e-2, max_k: int = 2,
                   policy: str = "cluster", link_policy: str = "none",
                   val_loader=None, silhouette_min=None,
-                  purity_gain=None) -> tuple[tuple[str, ...], dict]:
+                  purity_gain=None, leaf_init: str = "fresh") -> tuple[tuple[str, ...], dict]:
     """Split leaf `name` with cluster initialisation (see CONTEXT.md: Split initialisation).
 
     The leaf's images (the loader's first `limit_batches` batches) are split into k
@@ -441,7 +446,12 @@ def cluster_split(model, name: str, loader, device, noise: float = 1e-3,
     leaves (returned); each distinct linked leaf becomes one more router output, shared
     by the groups that link to it, and the router's pre-train labels and balance
     target follow those outputs.
+
+    Cascade only: with `leaf_init="copy"` and classifier leaves, the new leaves are deep copies
+    of the split leaf plus `noise` (no unit masking), unless the size check bumped the split
+    (sizes then differ, so they stay fresh). Routers are always fresh.
     """
+    old_step = model.steps[name] if hasattr(model, "steps") else None
     feats, hidden, reach, ys = _leaf_inputs(model, name, loader, device, limit_batches)
     grouped = class_groups(ys, reach, max_k) if policy == "class" else None
     extra = {"policy": policy}
@@ -510,8 +520,15 @@ def cluster_split(model, name: str, loader, device, noise: float = 1e-3,
     model.nodes[name] = model.build_node(name).to(feats.device)
     for n, g in zip(new, fresh_groups):
         fresh = model.build_node(n).to(feats.device)
-        model.nodes[n] = (fresh if hasattr(model, "steps")
-                          else _masked_leaf(old, fresh, masks[g], noise))
+        if not hasattr(model, "steps"):
+            fresh = _masked_leaf(old, fresh, masks[g], noise)
+        elif (leaf_init == "copy" and model.leaf == "classifier"
+              and model.steps[n] == old_step):
+            fresh = copy.deepcopy(old)
+            with torch.no_grad():
+                for p in fresh.parameters():
+                    p.add_(torch.randn_like(p) * noise)
+        model.nodes[n] = fresh
     outputs = torch.tensor([column[g] for g in range(k)], device=labels.device)[labels]
     info["router_pretrain_loss"] = _pretrain_router(
         model.nodes[name], feats, outputs, reach, pretrain_steps, pretrain_lr)
@@ -711,7 +728,8 @@ def save_graph_snapshot(model, run_dir, epoch: int) -> Path:
 def grow(model, loader, device, epoch: int, run_dir, max_nodes: int,
          limit_batches=None, noise: float = 1e-3, max_k: int = 2,
          policy: str = "cluster", link_policy: str = "none",
-         val_loader=None, silhouette_min=None, purity_gain=None) -> dict | None:
+         val_loader=None, silhouette_min=None, purity_gain=None,
+         leaf_init: str = "fresh") -> dict | None:
     """One growth step: cluster-split the leaf with the highest reach-weighted loss
     (ADR 0003), clustering the same batches the loss is measured on.
 
@@ -731,11 +749,13 @@ def grow(model, loader, device, epoch: int, run_dir, max_nodes: int,
     new, info = cluster_split(model, target, loader, device, noise, limit_batches,
                              max_k=room, policy=policy, link_policy=link_policy,
                              val_loader=val_loader, silhouette_min=silhouette_min,
-                             purity_gain=purity_gain)
+                             purity_gain=purity_gain, leaf_init=leaf_init)
     event = {"epoch": epoch, "split": target, "new_nodes": list(new),
              "num_nodes": len(model.graph.nodes), "leaf_losses": losses, **info}
     if hasattr(model, "steps"):
         event["steps"] = {n: model.steps[n] for n in new}
+        for n in (target, *new):  # the split leaf became a fresh router; the new leaves are new
+            model.last_change_epoch[n] = epoch
     with open(Path(run_dir) / "growth.jsonl", "a") as f:
         f.write(json.dumps(event) + "\n")
     save_graph_snapshot(model, run_dir, epoch)

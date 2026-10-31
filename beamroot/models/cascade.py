@@ -105,6 +105,7 @@ class CascadeModel(DAGRouterModel):
         self.graph = graph if graph is not None else default_graph()
         self.size_axis = size_axis
         self.start_step = start_step
+        self.last_change_epoch: dict[str, int] = {}  # training-time; epoch a node was made/bumped
         self.steps = dict(steps) if steps is not None else {}
         if steps is None:  # root starts at start_step, children inherit their parent's
             for name in self.graph.topological_order():
@@ -182,11 +183,13 @@ class CascadeModel(DAGRouterModel):
 
     def checkpoint(self) -> dict:
         return {"kind": "cascade", "config": self.config, "graph": self.graph.to_dict(),
-                "steps": dict(self.steps), "state_dict": self.state_dict()}
+                "steps": dict(self.steps), "last_change_epoch": dict(self.last_change_epoch),
+                "state_dict": self.state_dict()}
 
     @classmethod
     def from_checkpoint(cls, ckpt: dict) -> "CascadeModel":
         model = cls(graph=RouterGraph.from_dict(ckpt["graph"]), steps=ckpt["steps"],
                     **ckpt["config"])
+        model.last_change_epoch = dict(ckpt.get("last_change_epoch", {}))
         model.load_state_dict(ckpt["state_dict"])
         return model

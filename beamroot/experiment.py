@@ -50,6 +50,30 @@ GRIDS = {
                                           "--size-axis", axis, "--leaf", leaf]
                        for axis in ("resolution", "hidden", "both")
                        for leaf in ("classifier", "label")}}},
+    # Experiment 0004 follow-up: does a bigger node budget close the label-leaf gap? One leaf
+    # per class needs 19 nodes with perfect binary splits, so label variants plateau at 19.
+    "cascade29": {"datasets": ["mnist", "cifar10"], "seeds": [0],
+                  "epochs": {"mnist": 12, "cifar10": 15},
+                  "variants": {
+                      "dag-29": ["--model", "dag", "--merge", "--max-nodes", "29",
+                                 "--preset", "explainable"],
+                      **{f"{axis}-label-29": ["--model", "cascade", "--max-nodes", "29",
+                                              "--start-step", str(START_STEP),
+                                              "--size-axis", axis, "--leaf", "label"]
+                         for axis in ("resolution", "hidden", "both")}}},
+    # Do copied leaves / no late growth close the cheap classifier cascade's gap to dag?
+    "cascadeinit": {"datasets": ["mnist", "cifar10"], "seeds": [0],
+                    "epochs": {"mnist": 12, "cifar10": 15},
+                    "variants": {
+                        f"{axis}-classifier-{name}": [
+                            "--model", "cascade", "--leaf", "classifier", "--max-nodes", "19",
+                            "--start-step", str(START_STEP), "--size-axis", axis, *flags]
+                        for axis in ("resolution", "both")
+                        for name, flags in (
+                            ("copy", ["--leaf-init", "copy"]),
+                            ("settle", ["--settle-epochs", "3", "--bump-cooldown", "2"]),
+                            ("copy-settle", ["--leaf-init", "copy", "--settle-epochs", "3",
+                                             "--bump-cooldown", "2"]))}},
 }
 METRICS = ["beam1_acc", "beam3_acc", "soft_acc", "gap", "leaves", "mean_k", "links",
            "beam1_nodes", "split_router_entropy", "leaf_purity", "merges",

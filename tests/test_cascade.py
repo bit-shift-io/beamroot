@@ -458,3 +458,109 @@ def test_label_leaves_start_different():
     a, b = LabelLeaf(10), LabelLeaf(10)
     assert not torch.equal(a.logits, b.logits)
     assert a.logits.abs().max() > 0
+
+
+def _copy_split(leaf_init, centres=(-3.0, 3.0), **kw):
+    import copy
+    from beamroot.growth import cluster_split
+    torch.manual_seed(0)
+    m = CascadeModel(start_step=2)
+    leaf = m.graph.leaves()[0]
+    old = copy.deepcopy(m.nodes[leaf])
+    new, _ = cluster_split(m, leaf, _blobs(centres), "cpu", limit_batches=4,
+                           silhouette_min=kw.pop("smin", 0.1), leaf_init=leaf_init, **kw)
+    return m, old, new
+
+
+def _max_diff(a, b):
+    return max((p - q).abs().max().item() for p, q in zip(a.parameters(), b.parameters()))
+
+
+def test_copy_init_children_match_parent_up_to_noise():
+    m, old, new = _copy_split("copy")
+    assert all(_max_diff(m.nodes[n], old) < 0.02 for n in new)
+    assert _max_diff(m.nodes[new[0]], m.nodes[new[1]]) > 0  # noise differs per child
+
+
+def test_fresh_init_children_differ_from_parent():
+    m, old, new = _copy_split("fresh")
+    assert all(_max_diff(m.nodes[n], old) > 0.02 for n in new)
+
+
+def test_copy_init_with_bump_is_fresh():
+    m, old, new = _copy_split("copy", centres=(0.0,), smin=0.99)
+    assert all(m.steps[n] == 3 for n in new)
+    assert all(m.nodes[n].step == 3 for n in new)
+
+
+def test_copy_init_label_leaves_stay_fresh():
+    import copy
+    from beamroot.growth import cluster_split
+    torch.manual_seed(0)
+    m = CascadeModel(start_step=2, leaf="label")
+    leaf = m.graph.leaves()[0]
+    old = copy.deepcopy(m.nodes[leaf])
+    new, _ = cluster_split(m, leaf, _blobs((-3.0, 3.0)), "cpu", limit_batches=4,
+                           leaf_init="copy")
+    assert all(_max_diff(m.nodes[n], old) > 0.02 for n in new)
+
+
+def test_split_records_last_change_epoch():
+    from beamroot.growth import grow
+    import tempfile
+    torch.manual_seed(0)
+    m = CascadeModel(start_step=2)
+    leaf = m.graph.leaves()[0]
+    with tempfile.TemporaryDirectory() as d:
+        ev = grow(m, _blobs((-3.0, 3.0)), "cpu", 5, d, 9, limit_batches=4)
+    assert m.last_change_epoch[ev["split"]] == 5
+    assert all(m.last_change_epoch[n] == 5 for n in ev["new_nodes"])
+
+
+def test_checkpoint_keeps_last_change_and_loads_old():
+    m = CascadeModel(start_step=2)
+    m.last_change_epoch["root"] = 4
+    ckpt = m.checkpoint()
+    assert CascadeModel.from_checkpoint(ckpt).last_change_epoch == {"root": 4}
+    del ckpt["last_change_epoch"]
+    assert CascadeModel.from_checkpoint(ckpt).last_change_epoch == {}
+
+
+def test_bump_cooldown_skips_young_router_allows_old():
+    import math
+    from beamroot.growth import size_checks
+    stats = lambda r: {r: {"usage": [0.5, 0.5], "entropy": math.log(2)}}
+    m = CascadeModel(start_step=2)
+    r = _router(m)
+    m.last_change_epoch[r] = 4
+    assert size_checks(m, stats(r), 0.5, 0.1, "cpu", epoch=5, cooldown=2) == []
+    assert m.steps[r] == 2
+    out = size_checks(m, stats(r), 0.5, 0.1, "cpu", epoch=6, cooldown=2)
+    assert out[0]["to"] == 3 and m.last_change_epoch[r] == 6
+
+
+def _growth_epochs(tmp_path, extra):
+    import json
+    d = run(parse_args(["--dataset", "synthetic", "--model", "cascade", "--device", "cpu",
+                        "--epochs", "6", "--limit-batches", "2", "--grow-every", "1",
+                        "--max-nodes", "9", "--start-step", "2", "--no-report",
+                        "--silhouette-min", "0.99", "--runs-dir", str(tmp_path), *extra]))["run_dir"]
+    return [json.loads(l)["epoch"] for l in (d / "growth.jsonl").read_text().splitlines()]
+
+
+def test_settle_epochs_blocks_late_growth_and_bumps(tmp_path):
+    assert max(_growth_epochs(tmp_path / "a", [])) == 5
+    assert max(_growth_epochs(tmp_path / "b", ["--settle-epochs", "3"])) == 3
+
+
+def test_new_flags_run_with_copy_and_cooldown(tmp_path):
+    _growth_epochs(tmp_path, ["--leaf-init", "copy", "--bump-cooldown", "2"])
+
+
+@pytest.mark.parametrize("flags", [["--leaf-init", "copy"], ["--settle-epochs", "2"],
+                                   ["--bump-cooldown", "1"]])
+@pytest.mark.parametrize("model", ["dag", "baseline"])
+def test_non_cascade_rejects_new_flags(tmp_path, model, flags):
+    with pytest.raises(SystemExit):
+        run(parse_args(["--dataset", "synthetic", "--device", "cpu", "--limit-batches", "2",
+                        "--runs-dir", str(tmp_path), "--no-report", "--model", model, *flags]))

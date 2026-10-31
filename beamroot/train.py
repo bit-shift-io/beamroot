@@ -124,6 +124,9 @@ def run(args) -> dict:
             or args.entropy_max != 0.5 or args.spread_min != 0.1 \
             or args.purity_check or args.purity_gain != 0.05:
         raise SystemExit("--leaf, --prune-reach and --silhouette-min only apply to --model cascade")
+    elif args.leaf_init != "fresh" or args.settle_epochs != 0 or args.bump_cooldown != 0:
+        raise SystemExit("--leaf-init, --settle-epochs and --bump-cooldown only apply to "
+                         "--model cascade")
     torch.manual_seed(args.seed)
     device = select_device(args.device)
     if args.merge and args.val_size == 0:
@@ -174,7 +177,8 @@ def run(args) -> dict:
                   f"entropy {s['entropy']:.3f}", flush=True)
         print(f"epoch {epoch}: loss {last['loss']:.4f} test_acc {acc:.4f}", flush=True)
         # Grow after training on the current graph; never after the last epoch.
-        if growing and epoch % args.grow_every == 0 and epoch < args.epochs:
+        if (growing and epoch % args.grow_every == 0 and epoch < args.epochs
+                and args.epochs - epoch >= args.settle_epochs):
             merges = []
             if args.merge:  # merge first so freed nodes count towards the split budget
                 merges = merge_step(model, val_loader, device, epoch, run_dir,
@@ -187,7 +191,8 @@ def run(args) -> dict:
                     print(f"  merge: no pair below sym KL {args.merge_threshold}", flush=True)
             bumps = []
             if args.model == "cascade":
-                bumps = size_checks(model, stats, args.entropy_max, args.spread_min, device)
+                bumps = size_checks(model, stats, args.entropy_max, args.spread_min, device,
+                                    epoch=epoch, cooldown=args.bump_cooldown)
                 for b in bumps:
                     _log_event(run_dir, {"epoch": epoch, **b})
                     print(f"  bump {b['bump']} ({b['check']} {b['value']:.3f})"
@@ -199,7 +204,8 @@ def run(args) -> dict:
                          link_policy=args.link_policy, val_loader=val_loader,
                          silhouette_min=(args.silhouette_min if args.model == "cascade"
                                          else None),
-                         purity_gain=(args.purity_gain if args.purity_check else None))
+                         purity_gain=(args.purity_gain if args.purity_check else None),
+                         leaf_init=args.leaf_init)
             fresh = event["new_nodes"] if event else []  # fresh leaves only, not linked ones
             if event or merges or any('to' in b for b in bumps):
                 opt = rebuild_optimizer(model, opt)
@@ -246,6 +252,15 @@ def parse_args(argv=None):
                    help="cascade only: which dimensions follow the node size step")
     p.add_argument("--start-step", type=int, default=4, choices=[1, 2, 3, 4],
                    help="cascade only: the root's size step (4 = dag node size)")
+    p.add_argument("--leaf-init", choices=["fresh", "copy"], default="fresh",
+                   help="cascade only: new classifier leaves of a split start fresh or as noisy "
+                        "copies of the split leaf (--split-noise)")
+    p.add_argument("--settle-epochs", type=int, default=0,
+                   help="cascade only: no splits or size-check bumps when fewer than this many "
+                        "epochs remain after the growth step")
+    p.add_argument("--bump-cooldown", type=int, default=0,
+                   help="cascade only: size checks skip a router created or bumped fewer than "
+                        "this many epochs ago")
     p.add_argument("--prune-reach", type=float, default=0.01,
                    help="cascade only: while training, a node runs only on images whose reach "
                         "is at least this (0 = full soft routing)")
