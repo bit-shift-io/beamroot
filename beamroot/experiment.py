@@ -75,14 +75,26 @@ GRIDS = {
                             ("copy-settle", ["--leaf-init", "copy", "--settle-epochs", "3",
                                              "--bump-cooldown", "2"]))}},
 }
+# Experiment 0005: does freezing (and decaying) decisive ancestor routers cut training cost
+# without losing accuracy? Reuses the dag and best cascade variants' flags unchanged.
+_COPY_SETTLE = GRIDS["cascadeinit"]["variants"]["both-classifier-copy-settle"]
+GRIDS["cascadefreeze"] = {
+    "datasets": ["mnist"], "seeds": [0, 1, 2], "epochs": {"mnist": 12},
+    "variants": {
+        "dag": GRIDS["cascade"]["variants"]["dag"],
+        "both-classifier-copy-settle": _COPY_SETTLE,
+        "both-classifier-copy-settle-freeze": [*_COPY_SETTLE, "--freeze-routers", "quality"],
+        "both-classifier-copy-settle-decay-freeze": [
+            *_COPY_SETTLE, "--router-lr-decay", "0.5", "--freeze-routers", "quality"]}}
 METRICS = ["beam1_acc", "beam3_acc", "soft_acc", "gap", "leaves", "mean_k", "links",
            "beam1_nodes", "split_router_entropy", "leaf_purity", "merges",
            "closest_merge_kl", "train_minutes", "beam1_macs", "beam1_ms", "bumps", "mean_step",
-           "train_evals"]
+           "train_evals", "trained_evals", "frozen_routers"]
 HEADERS = ["beam-1 acc", "beam-3 acc", "soft acc", "soft − beam-1", "leaves", "mean k",
            "links", "beam-1 nodes", "split-router entropy", "leaf purity",
            "merges", "closest merge KL", "train min", "beam-1 MACs", "beam-1 ms/image",
-           "bumps", "mean node step", "train node evals/image"]
+           "bumps", "mean node step", "train node evals/image",
+           "trained node evals/image", "frozen routers"]
 
 
 def _jsonl(path: Path) -> list[dict]:
@@ -109,6 +121,9 @@ def run_metrics(run_dir) -> dict:
     extra = json.loads((run_dir / "experiment.json").read_text())
     beam1_row = next((r for r in evaluated if r["mode"] == "beam 1"), {})
     evals = [e["node_evals"] for e in _jsonl(run_dir / "metrics.jsonl") if "node_evals" in e]
+    trained = [e["trained_node_evals"] for e in _jsonl(run_dir / "metrics.jsonl")
+               if "trained_node_evals" in e]
+    freezes = [e["freezes"] for e in _jsonl(run_dir / "metrics.jsonl") if "freezes" in e]
     merges, kls, ks, links, bumps = 0, [], [], 0, 0
     for event in _jsonl(run_dir / "growth.jsonl"):
         # a router-check line has "bump": name; a split event's size check has "bump": {...}
@@ -144,6 +159,8 @@ def run_metrics(run_dir) -> dict:
         "bumps": bumps,
         "mean_step": extra.get("mean_step"),
         "train_evals": _mean_or_none(evals),
+        "trained_evals": _mean_or_none(trained),
+        "frozen_routers": freezes[-1] if freezes else None,   # count at the final epoch
     }
 
 
@@ -210,7 +227,7 @@ def _cell(s: dict, digits: int) -> str:
 def format_table(rows: list[dict]) -> str:
     digits = {"merges": 1, "train_minutes": 1, "leaves": 1, "mean_k": 2, "links": 1,
               "beam1_nodes": 2, "beam1_macs": 0, "beam1_ms": 2, "bumps": 1,
-              "mean_step": 2, "train_evals": 2}
+              "mean_step": 2, "train_evals": 2, "trained_evals": 2, "frozen_routers": 1}
     with_variant = any(r.get("variant") for r in rows)
     head = ["dataset"] + (["variant"] if with_variant else []) + ["n"] + HEADERS
     lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]

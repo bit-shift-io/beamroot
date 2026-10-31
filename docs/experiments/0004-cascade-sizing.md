@@ -79,7 +79,7 @@ Fresh rows are repeated from the `cascade` grid for comparison.
 - **-copy:** copying the parent leaf is the clearest accuracy gain: `resolution` +2.7 points (0.941 → 0.968), `both` +2.3 (0.931 → 0.954). It supports the idea that fresh leaves were under-trained. MACs are unchanged to slightly changed.
 - **-settle (settle 3 + cooldown 2):** cuts bumps from 18 to 12 and the mean step from about 2.0 to 1.63, which more than halves MACs on `resolution` (5.71M → 2.70M, with accuracy 0.941 → 0.958). So premature bumps were inflating cost. The bundled knobs cannot be separated.
 - **-copy-settle:** `both` reaches 0.958 at 1.35M MACs with only 8 bumps and mean step 1.42: 3.5× fewer MACs than `dag` for 3.3 points less accuracy. This is the first cascade variant that clearly beats `dag` on cost. On `resolution`, copy-settle (0.965) is not better than copy alone (0.968).
-- **Training time:** wall-clock minutes went up in `cascadeinit` (46–88 min against about 30 for the fresh runs), not down. The cause is unexplained; the grid ran alone. Training cost matters if cost includes it.
+- **Training time:** wall-clock minutes went up in `cascadeinit` (46–88 min against about 30 for the fresh runs), not down. The grid ran alone. Training cost matters if cost includes it. A later probe (2026-10-31) re-ran `both-classifier` fresh and settle for 4 epochs. The graphs and node evals were identical to the grid runs, yet epoch 4 took 126 s and 163 s, against 176 s and 299 s in the grid. MPS memory levelled off at about 440 MB, with no swap and no CPU throttling. So most of the rise was variation in this machine's speed from one day to the next (1.4–1.8× for the same work), not the flags. `train min` is not comparable between runs; node evals per image is the dependable cost measure.
 - **ms/image:** not trusted. At batch size 1 on a GPU it mostly measures per-call overhead (dag 5 ms, cascade 4–12 ms).
 
 ## Not tried
@@ -87,7 +87,6 @@ Fresh rows are repeated from the `cascade` grid for comparison.
 - **More seeds.** One seed only; MNIST seeds agree closely, but gaps of about 1 point (e.g. among the settle variants) are inside noise. The headline comparison (`dag` vs `both-classifier-copy-settle`) should get seeds 1 and 2.
 - **`copy` and `settle` on the `hidden` axis,** and on the `both` axis with a cooldown value other than 2 or a settle other than 3.
 - **Separating settle from cooldown,** and measuring when the bumps fall in the existing runs (late bumps are rebuilt fresh with no pre-training).
-- **Why training time rose** with copy and settle.
 - **A self-stopping growth rule** (stop when the worst leaf's loss is under a threshold or a split does not improve validation accuracy). `--max-nodes` already caps growth, so this was left as a separate design.
 - **A hybrid leaf** (label leaf plus a tiny model on the node's hidden features) and tuning `LABEL_INIT_STD`: moot if label leaves are dropped.
 - **A bigger step-1 node.** Step 1 (8 channels at 7×7) is still the weakest rung (0.874 single-node at 10 epochs, against 0.952 at step 2).

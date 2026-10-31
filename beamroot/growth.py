@@ -386,11 +386,14 @@ def size_checks(model, stats: dict, entropy_max: float, spread_min: float, devic
     A router whose entropy exceeds `entropy_max` * ln k, or whose smallest child usage is below
     `spread_min` * 2 / k, is rebuilt fresh one step up (same children and balance target).
     At `MAX_STEP` it is left alone. A router younger than `cooldown` epochs (since it was
-    created or last bumped, `model.last_change_epoch`) is skipped. Returns the bump records; the caller rebuilds the optimiser.
+    created or last bumped, `model.last_change_epoch`) is skipped, as is a frozen router
+    (`model.frozen`). Returns the bump records; the caller rebuilds the optimiser.
     """
     records = []
     for name, s in stats.items():
         if name not in model.nodes or model.graph.nodes[name].kind != "router":
+            continue
+        if name in model.frozen:
             continue
         if cooldown and epoch - model.last_change_epoch.get(name, 0) < cooldown:
             continue
@@ -409,8 +412,31 @@ def size_checks(model, stats: dict, entropy_max: float, spread_min: float, devic
         ref = next(model.nodes[name].parameters())
         model.nodes[name] = model.build_node(name).to(ref.device)
         model.last_change_epoch[name] = epoch
+        model.decay_start.pop(name, None)  # a bumped router is not an ancestor until the next split
+        model.frozen.discard(name)  # fresh weights train (build_node gives requires_grad=True)
         records.append({"bump": name, "check": check, "from": step, "to": step + 1,
                         "value": value})
+    return records
+
+
+def freeze_checks(model, stats: dict, entropy_max: float, spread_min: float) -> list[dict]:
+    """Router freeze on last epoch's router `stats` ({router: usage, entropy}).
+
+    An unfrozen ancestor router (one in `model.decay_start`) whose entropy is at most
+    `entropy_max` * ln k and whose smallest child usage is at least `spread_min` * 2 / k
+    stops training: its params get requires_grad=False and it joins `model.frozen`.
+    Returns one `{"freeze", "entropy", "spread"}` record per frozen router.
+    """
+    records = []
+    for name, s in stats.items():
+        if name not in model.decay_start or name in model.frozen or name not in model.nodes:
+            continue
+        k = len(s["usage"])
+        spread = min(s["usage"])
+        if s["entropy"] <= entropy_max * math.log(k) and spread >= spread_min * 2 / k:
+            model.nodes[name].requires_grad_(False)
+            model.frozen.add(name)
+            records.append({"freeze": name, "entropy": s["entropy"], "spread": spread})
     return records
 
 
@@ -662,12 +688,15 @@ def merge_candidates(model, loader, device, limit_batches=None,
 def merge_nodes(model, keep: str, drop: str) -> list[str]:
     """Merge node `drop` into `keep` in a DAGRouterModel, in place (see RouterGraph.merge).
 
-    Removes the modules of `drop` and of every node left unreachable; returns their names.
+    Removes the modules of `drop` and of every node left unreachable (and from a cascade's
+    `frozen` set); returns their names.
     Routers keep their output width because redirected edges keep their column.
     """
     removed = model.graph.merge(keep, drop)
     for n in removed:
         del model.nodes[n]
+        if hasattr(model, "frozen"):
+            model.frozen.discard(n)
     return removed
 
 
@@ -704,18 +733,54 @@ def _log_event(run_dir, event: dict) -> None:
         f.write(json.dumps(event) + "\n")
 
 
-def rebuild_optimizer(model, opt: torch.optim.Optimizer) -> torch.optim.Optimizer:
+def node_param_groups(model, lr: float) -> list[dict]:
+    """One param group per cascade node, in `model.nodes` order, each at `lr` and tagged
+    with its node name (`group["node"]`) so its rate can be set on its own."""
+    return [{"params": list(m.parameters()), "lr": lr, "node": n}
+            for n, m in model.nodes.items()]
+
+
+def set_router_lrs(model, opt: torch.optim.Optimizer, lr: float, decay: float,
+                   epoch: int) -> None:
+    """Router decay, before training `epoch`: an ancestor router's group (one with a
+    `model.decay_start`) trains at `lr` * `decay` ** (epochs since it); every other group at `lr`."""
+    for g in opt.param_groups:
+        start = model.decay_start.get(g["node"])
+        g["lr"] = lr if start is None else lr * decay ** (epoch - start)
+
+
+def rebuild_optimizer(model, opt: torch.optim.Optimizer, lr: float | None = None
+                      ) -> torch.optim.Optimizer:
     """New optimiser of the same type and hyperparameters over all current params.
 
     Params that survive the growth step keep their state (e.g. Adam moments);
     new params start with fresh state. The split leaf's old params are dropped.
+    An optimiser with per-node groups (`node_param_groups`) gets per-node groups again,
+    all at the base `lr`: a group's own lr may be decayed, so it is not the default.
     """
-    defaults = {k: v for k, v in opt.param_groups[0].items() if k != "params"}
-    new = type(opt)(model.parameters(), **defaults)
+    defaults = {k: v for k, v in opt.param_groups[0].items() if k not in ("params", "node")}
+    if "node" in opt.param_groups[0]:
+        if lr is None:
+            raise ValueError("per-node param groups need the base lr")
+        defaults["lr"] = lr
+        new = type(opt)(node_param_groups(model, lr), **defaults)
+    else:
+        new = type(opt)(model.parameters(), **defaults)
     for p in model.parameters():
         if p in opt.state:
             new.state[p] = opt.state[p]
     return new
+
+
+def _ancestors(graph, name: str) -> set[str]:
+    """Every node with a path to `name`, through all parents (the graph is a DAG)."""
+    seen, stack = set(), [name]
+    while stack:
+        for p in graph.parents(stack.pop()):
+            if p not in seen:
+                seen.add(p)
+                stack.append(p)
+    return seen
 
 
 def save_graph_snapshot(model, run_dir, epoch: int) -> Path:
@@ -756,6 +821,8 @@ def grow(model, loader, device, epoch: int, run_dir, max_nodes: int,
         event["steps"] = {n: model.steps[n] for n in new}
         for n in (target, *new):  # the split leaf became a fresh router; the new leaves are new
             model.last_change_epoch[n] = epoch
+        for n in _ancestors(model.graph, target):  # only the first split below sets it
+            model.decay_start.setdefault(n, epoch)
     with open(Path(run_dir) / "growth.jsonl", "a") as f:
         f.write(json.dumps(event) + "\n")
     save_graph_snapshot(model, run_dir, epoch)

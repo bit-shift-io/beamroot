@@ -8,7 +8,8 @@ import torch.nn.functional as F
 
 from beamroot.data import dataset_info, get_loaders
 from beamroot.device import select_device
-from beamroot.growth import _log_event, grow, merge_step, size_checks, rebuild_optimizer, save_graph_snapshot
+from beamroot.growth import (_log_event, freeze_checks, grow, merge_step, node_param_groups,
+                             rebuild_optimizer, save_graph_snapshot, set_router_lrs, size_checks)
 from beamroot.losses import balance_loss, path_loss, router_usage, routing_entropy
 from beamroot.models.baseline import BaselineCNN, count_params, match_width
 from beamroot.models.cascade import CascadeModel
@@ -44,7 +45,7 @@ def train_epoch(model, loader, opt, device, limit_batches=None, balance_weight=0
     """
     model.train()
     if hasattr(model, "node_evals"):
-        model.node_evals = model.rows_seen = 0
+        model.node_evals = model.rows_seen = model.trained_evals = 0
     losses = []
     sums, steps = {}, 0
     ce_sum = bal_sum = 0.0
@@ -80,6 +81,7 @@ def train_epoch(model, loader, opt, device, limit_batches=None, balance_weight=0
         parts.update({"ce": ce_sum / steps, "balance": bal_sum / steps})
         if getattr(model, "rows_seen", 0):
             parts["evals"] = model.node_evals / model.rows_seen
+            parts["trained_evals"] = model.trained_evals / model.rows_seen
     return losses
 
 
@@ -124,9 +126,11 @@ def run(args) -> dict:
             or args.entropy_max != 0.5 or args.spread_min != 0.1 \
             or args.purity_check or args.purity_gain != 0.05:
         raise SystemExit("--leaf, --prune-reach and --silhouette-min only apply to --model cascade")
-    elif args.leaf_init != "fresh" or args.settle_epochs != 0 or args.bump_cooldown != 0:
-        raise SystemExit("--leaf-init, --settle-epochs and --bump-cooldown only apply to "
-                         "--model cascade")
+    elif args.leaf_init != "fresh" or args.settle_epochs != 0 or args.bump_cooldown != 0 \
+            or args.router_lr_decay != 1.0 or args.freeze_routers != "off" \
+            or args.freeze_entropy_max != 0.25:
+        raise SystemExit("--leaf-init, --settle-epochs, --bump-cooldown, --router-lr-decay, "
+                         "--freeze-routers and --freeze-entropy-max only apply to --model cascade")
     torch.manual_seed(args.seed)
     device = select_device(args.device)
     if args.merge and args.val_size == 0:
@@ -145,7 +149,10 @@ def run(args) -> dict:
                         args.size_axis, args.start_step, args.leaf).to(device)
     if args.model == "cascade":
         model.prune_reach = args.prune_reach
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    if args.model == "cascade":  # one group per node, so ancestor routers can decay alone
+        opt = torch.optim.Adam(node_param_groups(model, args.lr), lr=args.lr)
+    else:
+        opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     config = {**vars(args), "resolved_device": str(device), "params": count_params(model)}
     run_dir = create_run_dir(args.name or f"{args.dataset}-{args.model}", args.runs_dir, config)
     growing = isinstance(model, DAGRouterModel) and args.grow_every > 0
@@ -156,6 +163,8 @@ def run(args) -> dict:
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         stats, parts = {}, {}
+        if args.model == "cascade":
+            set_router_lrs(model, opt, args.lr, args.router_lr_decay, epoch)
         losses = train_epoch(model, train_loader, opt, device, args.limit_batches,
                              args.balance_weight, stats, parts)
         if first_loss is None:
@@ -167,6 +176,8 @@ def run(args) -> dict:
             last["ce_loss"], last["balance_loss"] = parts["ce"], parts["balance"]
         if "evals" in parts:
             last["node_evals"] = parts["evals"]
+            last["trained_node_evals"] = parts["trained_evals"]
+            last["freezes"] = len(model.frozen)
         if stats:
             last["routing"] = stats
         if isinstance(model, DAGRouterModel):
@@ -176,6 +187,12 @@ def run(args) -> dict:
             print(f"  {name}: usage {[round(v, 3) for v in s['usage']]} "
                   f"entropy {s['entropy']:.3f}", flush=True)
         print(f"epoch {epoch}: loss {last['loss']:.4f} test_acc {acc:.4f}", flush=True)
+        # Freeze before size checks and growth; settle epochs do not block it.
+        if args.model == "cascade" and args.freeze_routers == "quality" and epoch < args.epochs:
+            for f in freeze_checks(model, stats, args.freeze_entropy_max, args.spread_min):
+                _log_event(run_dir, {"epoch": epoch, **f})
+                print(f"  freeze {f['freeze']} (entropy {f['entropy']:.3f} "
+                      f"spread {f['spread']:.3f})", flush=True)
         # Grow after training on the current graph; never after the last epoch.
         if (growing and epoch % args.grow_every == 0 and epoch < args.epochs
                 and args.epochs - epoch >= args.settle_epochs):
@@ -208,7 +225,7 @@ def run(args) -> dict:
                          leaf_init=args.leaf_init)
             fresh = event["new_nodes"] if event else []  # fresh leaves only, not linked ones
             if event or merges or any('to' in b for b in bumps):
-                opt = rebuild_optimizer(model, opt)
+                opt = rebuild_optimizer(model, opt, lr=args.lr)
             if event:
                 print(f"  split {event['split']} -> {event['new_nodes']} (k {event['k']}) "
                       f"({event['num_nodes']} nodes)", flush=True)
@@ -255,6 +272,15 @@ def parse_args(argv=None):
     p.add_argument("--leaf-init", choices=["fresh", "copy"], default="fresh",
                    help="cascade only: new classifier leaves of a split start fresh or as noisy "
                         "copies of the split leaf (--split-noise)")
+    p.add_argument("--router-lr-decay", type=float, default=1.0,
+                   help="cascade only: an ancestor router's learning rate is multiplied by this "
+                        "each epoch after the first split below it (1.0 = off)")
+    p.add_argument("--freeze-routers", choices=["off", "quality"], default="off",
+                   help="cascade only: quality = an ancestor router whose entropy and spread pass "
+                        "the freeze bar stops training for good")
+    p.add_argument("--freeze-entropy-max", type=float, default=0.25,
+                   help="cascade only: --freeze-routers quality freezes a router whose entropy is "
+                        "at most this x ln k (and whose spread passes --spread-min)")
     p.add_argument("--settle-epochs", type=int, default=0,
                    help="cascade only: no splits or size-check bumps when fewer than this many "
                         "epochs remain after the growth step")

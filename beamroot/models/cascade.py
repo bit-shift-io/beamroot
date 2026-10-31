@@ -101,11 +101,13 @@ class CascadeModel(DAGRouterModel):
         nn.Module.__init__(self)
         self.leaf = leaf
         self.prune_reach = 0.0   # training-time pruning threshold; set by train, not saved
-        self.node_evals = self.rows_seen = 0   # node evaluations per image = ratio
+        self.node_evals = self.rows_seen = self.trained_evals = 0   # node evaluations per image = ratio
         self.graph = graph if graph is not None else default_graph()
         self.size_axis = size_axis
         self.start_step = start_step
         self.last_change_epoch: dict[str, int] = {}  # training-time; epoch a node was made/bumped
+        self.decay_start: dict[str, int] = {}  # ancestor router -> epoch of the first split below it
+        self.frozen: set[str] = set()  # routers frozen by --freeze-routers (requires_grad off)
         self.steps = dict(steps) if steps is not None else {}
         if steps is None:  # root starts at start_step, children inherit their parent's
             for name in self.graph.topological_order():
@@ -146,12 +148,16 @@ class CascadeModel(DAGRouterModel):
         out[idx] = sub
         return out
 
+    def _trained(self, name: str) -> bool:
+        return any(p.requires_grad for p in self.nodes[name].parameters())
+
     def route(self, x: torch.Tensor) -> dict:
         """Like `DAGRouterModel.route`, but while training with `prune_reach` > 0 a node
         runs only on rows whose summed reach is at least that (pruned soft routing)."""
         self.rows_seen += x.shape[0]
         if not (self.training and self.prune_reach > 0):
             self.node_evals += x.shape[0] * len(self.graph.nodes)
+            self.trained_evals += x.shape[0] * sum(self._trained(n) for n in self.graph.nodes)
             return super().route(x)
         log_r = torch.log(torch.tensor(self.prune_reach))
         order = self.graph.topological_order()
@@ -168,6 +174,7 @@ class CascadeModel(DAGRouterModel):
                 log_reach[name] = torch.where(active, s, torch.full_like(s, float("-inf")))
             idx = active.nonzero().squeeze(1)
             self.node_evals += len(idx)
+            self.trained_evals += len(idx) * self._trained(name)
             if self.graph.nodes[name].kind == "router":
                 k = len(self.graph.children(name))
                 log_route[name] = self._run_rows(name, x, idx, x.new_full((1, k), -math.log(k)))
@@ -184,6 +191,7 @@ class CascadeModel(DAGRouterModel):
     def checkpoint(self) -> dict:
         return {"kind": "cascade", "config": self.config, "graph": self.graph.to_dict(),
                 "steps": dict(self.steps), "last_change_epoch": dict(self.last_change_epoch),
+                "decay_start": dict(self.decay_start), "frozen": sorted(self.frozen),
                 "state_dict": self.state_dict()}
 
     @classmethod
@@ -191,5 +199,9 @@ class CascadeModel(DAGRouterModel):
         model = cls(graph=RouterGraph.from_dict(ckpt["graph"]), steps=ckpt["steps"],
                     **ckpt["config"])
         model.last_change_epoch = dict(ckpt.get("last_change_epoch", {}))
+        model.decay_start = dict(ckpt.get("decay_start", {}))
         model.load_state_dict(ckpt["state_dict"])
+        model.frozen = set(ckpt.get("frozen", []))
+        for name in model.frozen:
+            model.nodes[name].requires_grad_(False)
         return model

@@ -246,3 +246,33 @@ def test_cascadeinit_grid_variants():
         assert "--leaf" in flags and flags[flags.index("--leaf") + 1] == "classifier"
     copy = variants["both-classifier-copy-settle"]
     assert "--leaf-init" in copy and "--settle-epochs" in copy and "--bump-cooldown" in copy
+
+
+def test_summary_reads_trained_evals_and_freezes(tmp_path):
+    run = fake_run(tmp_path / "run")
+    write_jsonl(run / "metrics.jsonl", [
+        {"epoch": 1, "node_evals": 4.0, "trained_node_evals": 4.0, "freezes": 0},
+        {"epoch": 2, "node_evals": 4.0, "trained_node_evals": 2.0, "freezes": 1}])
+    m = experiment.run_metrics(run)
+    assert (m["trained_evals"], m["frozen_routers"]) == (3.0, 1)
+    assert "trained node evals/image" in experiment.format_table(
+        [{"dataset": "mnist", "n": 1, **{k: experiment._stats([v]) for k, v in m.items()
+                                         if k in experiment.METRICS}}])
+
+
+def test_summary_old_run_shows_dash_for_trained_evals(tmp_path):
+    m = experiment.run_metrics(fake_run(tmp_path / "run"))
+    assert (m["trained_evals"], m["frozen_routers"]) == (None, None)
+
+
+def test_cascadefreeze_grid_reuses_existing_variants_and_adds_freeze():
+    grid = experiment.GRIDS["cascadefreeze"]
+    assert (grid["datasets"], grid["seeds"], grid["epochs"]) == (["mnist"], [0, 1, 2], {"mnist": 12})
+    variants = grid["variants"]
+    base = experiment.GRIDS["cascadeinit"]["variants"]["both-classifier-copy-settle"]
+    assert variants == {
+        "dag": experiment.GRIDS["cascade"]["variants"]["dag"],
+        "both-classifier-copy-settle": base,
+        "both-classifier-copy-settle-freeze": [*base, "--freeze-routers", "quality"],
+        "both-classifier-copy-settle-decay-freeze": [
+            *base, "--router-lr-decay", "0.5", "--freeze-routers", "quality"]}

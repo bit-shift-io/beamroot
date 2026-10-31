@@ -665,3 +665,39 @@ def test_link_scoring_leaves_training_rng_untouched(tmp_path):
     base = weights["none"]
     for policy in ("loss", "class"):
         assert all(torch.equal(weights[policy][k], base[k]) for k in base)
+
+
+def test_rebuild_optimizer_keeps_node_groups_at_base_lr_and_state():
+    from beamroot.growth import node_param_groups, rebuild_optimizer, split_leaf
+    from beamroot.models.cascade import CascadeModel
+    torch.manual_seed(0)
+    model = CascadeModel(start_step=1)
+    opt = torch.optim.Adam(node_param_groups(model, 1e-3), lr=1e-3)
+    opt.param_groups[0]["lr"] = 2.5e-4  # the root, decayed
+    x, y = torch.randn(4, 1, 28, 28), torch.randint(0, 10, (4,))
+    torch.nn.functional.nll_loss(model(x), y).backward()
+    opt.step()
+    root_p = next(model.nodes["root"].parameters())
+    old_state = {k: v.clone() for k, v in opt.state[root_p].items()}
+    split_leaf(model, "leaf0")
+    opt = rebuild_optimizer(model, opt, lr=1e-3)
+    assert [g["node"] for g in opt.param_groups] == list(model.nodes)
+    assert all(g["lr"] == 1e-3 for g in opt.param_groups)
+    assert [id(p) for g in opt.param_groups for p in g["params"]] == \
+        [id(p) for p in model.parameters()]
+    for k, v in old_state.items():
+        assert torch.equal(opt.state[root_p][k], v)
+
+
+def test_router_decay_sets_ancestor_lr_and_full_lr_elsewhere():
+    from beamroot.growth import node_param_groups, set_router_lrs
+    from beamroot.models.cascade import CascadeModel
+    model = CascadeModel(start_step=1)
+    opt = torch.optim.Adam(node_param_groups(model, 1e-3), lr=1e-3)
+    model.decay_start["root"] = 3  # split below root after epoch 3
+    set_router_lrs(model, opt, 1e-3, 0.5, epoch=5)
+    lrs = {g["node"]: g["lr"] for g in opt.param_groups}
+    assert lrs == {"root": 2.5e-4, "leaf0": 1e-3, "leaf1": 1e-3}
+    del model.decay_start["root"]  # bumped
+    set_router_lrs(model, opt, 1e-3, 0.5, epoch=6)
+    assert all(g["lr"] == 1e-3 for g in opt.param_groups)

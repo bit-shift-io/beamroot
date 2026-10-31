@@ -558,9 +558,246 @@ def test_new_flags_run_with_copy_and_cooldown(tmp_path):
 
 
 @pytest.mark.parametrize("flags", [["--leaf-init", "copy"], ["--settle-epochs", "2"],
-                                   ["--bump-cooldown", "1"]])
+                                   ["--bump-cooldown", "1"], ["--router-lr-decay", "0.5"]])
 @pytest.mark.parametrize("model", ["dag", "baseline"])
 def test_non_cascade_rejects_new_flags(tmp_path, model, flags):
     with pytest.raises(SystemExit):
         run(parse_args(["--dataset", "synthetic", "--device", "cpu", "--limit-batches", "2",
                         "--runs-dir", str(tmp_path), "--no-report", "--model", model, *flags]))
+
+
+def test_checkpoint_keeps_decay_start_and_loads_old():
+    m = CascadeModel(start_step=2)
+    m.decay_start["root"] = 3
+    ckpt = m.checkpoint()
+    assert CascadeModel.from_checkpoint(ckpt).decay_start == {"root": 3}
+    del ckpt["decay_start"]
+    assert CascadeModel.from_checkpoint(ckpt).decay_start == {}
+
+
+def _two_path_cascade():
+    """root -> a, b; a and b both -> l1, l2: every leaf has ancestors root, a and b."""
+    from beamroot.models.graph import RouterGraph
+    g = RouterGraph()
+    g.add_node("root", "router")
+    for r in ("a", "b"):
+        g.add_node(r, "router", parents=["root"])
+    for leaf in ("l1", "l2"):
+        g.add_node(leaf, "leaf", parents=["a", "b"])
+    return CascadeModel(graph=g, start_step=2)
+
+
+def test_split_marks_every_ancestor_once():
+    from beamroot.growth import grow
+    import tempfile
+    torch.manual_seed(0)
+    m = _two_path_cascade()
+    with tempfile.TemporaryDirectory() as d:
+        ev = grow(m, _blobs((-3.0, 3.0)), "cpu", 5, d, 20, limit_batches=4)
+        assert m.decay_start == {"root": 5, "a": 5, "b": 5}
+        ev2 = grow(m, _blobs((-3.0, 3.0)), "cpu", 7, d, 20, limit_batches=4)
+    below_first = ev2["split"] in ev["new_nodes"]
+    assert m.decay_start == {"root": 5, "a": 5, "b": 5, **({ev["split"]: 7} if below_first else {})}
+
+
+def test_bump_clears_decay_start():
+    import math
+    from beamroot.growth import size_checks
+    m = CascadeModel(start_step=2)
+    r = _router(m)
+    m.decay_start[r] = 2
+    size_checks(m, {r: {"usage": [0.5, 0.5], "entropy": math.log(2)}}, 0.5, 0.1, "cpu", epoch=4)
+    assert r not in m.decay_start
+
+
+def test_node_param_groups_train_like_one_group():
+    import copy
+    from beamroot.growth import node_param_groups
+    torch.manual_seed(0)
+    a = CascadeModel(start_step=1)
+    b = copy.deepcopy(a)
+    opt_a = torch.optim.Adam(a.parameters(), lr=1e-3)
+    opt_b = torch.optim.Adam(node_param_groups(b, 1e-3), lr=1e-3)
+    assert [g["node"] for g in opt_b.param_groups] == list(b.nodes)
+    x, y = torch.randn(8, 1, 28, 28), torch.randint(0, 10, (8,))
+    for m, opt in ((a, opt_a), (b, opt_b)):
+        torch.manual_seed(1)  # same dropout masks in both runs
+        for _ in range(3):
+            opt.zero_grad()
+            F.nll_loss(m(x), y).backward()
+            opt.step()
+    assert all(torch.equal(p, q) for p, q in zip(a.parameters(), b.parameters()))
+
+
+def test_router_lr_decay_is_cascade_only(tmp_path):
+    with pytest.raises(SystemExit, match="--router-lr-decay.*only apply to --model cascade"):
+        run(parse_args(["--dataset", "synthetic", "--device", "cpu", "--limit-batches", "2",
+                        "--runs-dir", str(tmp_path), "--no-report", "--model", "dag",
+                        "--router-lr-decay", "0.5"]))
+
+
+def test_router_lr_decay_run_saves_decay_start(tmp_path):
+    d = run(parse_args(["--dataset", "synthetic", "--model", "cascade", "--device", "cpu",
+                        "--epochs", "4", "--limit-batches", "2", "--grow-every", "1",
+                        "--max-nodes", "9", "--start-step", "2", "--no-report",
+                        "--router-lr-decay", "0.5", "--runs-dir", str(tmp_path)]))["run_dir"]
+    ckpt = torch.load(d / "model.pt")
+    # root: bumped at epoch 2 (cleared), then marked again by that epoch's split below it
+    assert ckpt["decay_start"] == {"root": 2}
+
+
+def _decisive(r, entropy_frac=0.1):
+    import math
+    return {r: {"usage": [0.5, 0.5], "entropy": entropy_frac * math.log(2)}}
+
+
+def test_freeze_checks_freeze_a_decisive_ancestor_only():
+    from beamroot.growth import freeze_checks
+    m = CascadeModel(start_step=2)
+    r = _router(m)
+    assert freeze_checks(m, _decisive(r), 0.25, 0.1) == [] and m.frozen == set()
+    m.decay_start[r] = 2
+    out = freeze_checks(m, _decisive(r), 0.25, 0.1)
+    assert out == [{"freeze": r, "entropy": _decisive(r)[r]["entropy"], "spread": 0.5}]
+    assert m.frozen == {r}
+    assert not any(p.requires_grad for p in m.nodes[r].parameters())
+
+
+def test_freeze_checks_skip_router_between_freeze_and_bump_bars():
+    from beamroot.growth import freeze_checks
+    m = CascadeModel(start_step=2)
+    r = _router(m)
+    m.decay_start[r] = 2
+    assert freeze_checks(m, _decisive(r, 0.4), 0.25, 0.1) == [] and m.frozen == set()
+    st = {r: {"usage": [0.92, 0.08], "entropy": 0.01}}  # decisive but under the spread bar
+    assert freeze_checks(m, st, 0.25, 0.1) == [] and m.frozen == set()
+
+
+def test_frozen_router_keeps_params_and_adam_state_while_others_train():
+    from beamroot.growth import freeze_checks, node_param_groups
+    from beamroot.train import train_epoch
+    torch.manual_seed(0)
+    m = CascadeModel(start_step=1)
+    opt = torch.optim.Adam(node_param_groups(m, 1e-2), lr=1e-2)
+    batch = [(torch.randn(8, 1, 28, 28), torch.randint(0, 10, (8,)))]
+    train_epoch(m, batch, opt, "cpu")  # Adam state exists, so momentum alone would move it
+    m.decay_start["root"] = 1
+    freeze_checks(m, _decisive("root"), 0.25, 0.1)
+    root = {k: v.clone() for k, v in m.nodes["root"].state_dict().items()}
+    state = {k: v.clone() for k, v in opt.state[next(m.nodes["root"].parameters())].items()}
+    leaf = {k: v.clone() for k, v in m.nodes["leaf0"].state_dict().items()}
+    train_epoch(m, batch, opt, "cpu")
+    assert all(torch.equal(v, m.nodes["root"].state_dict()[k]) for k, v in root.items())
+    assert all(p.grad is None for p in m.nodes["root"].parameters())
+    assert all(torch.equal(v, opt.state[next(m.nodes["root"].parameters())][k])
+               for k, v in state.items())
+    assert not all(torch.equal(v, m.nodes["leaf0"].state_dict()[k]) for k, v in leaf.items())
+
+
+def test_size_checks_skip_frozen_router():
+    from beamroot.growth import freeze_checks, size_checks
+    m = CascadeModel(start_step=2)
+    r = _router(m)
+    m.decay_start[r] = 2
+    freeze_checks(m, _decisive(r), 0.25, 0.1)
+    before = m.nodes[r]
+    assert size_checks(m, _decisive(r, 1.0), 0.5, 0.1, "cpu", epoch=4) == []
+    assert m.nodes[r] is before and m.steps[r] == 2 and m.frozen == {r}
+
+
+def test_merge_unfreezes_the_merged_router():
+    from beamroot.growth import merge_nodes
+    from beamroot.models.graph import RouterGraph
+    g = RouterGraph()  # root -> a, c; c -> b: a and b share no parent
+    g.add_node("root", "router")
+    g.add_node("a", "router", parents=["root"])
+    g.add_node("c", "router", parents=["root"])
+    g.add_node("b", "router", parents=["c"])
+    g.add_node("l0", "leaf", parents=["c"])
+    for leaf, parent in (("l1", "a"), ("l2", "a"), ("l3", "b"), ("l4", "b")):
+        g.add_node(leaf, "leaf", parents=[parent])
+    m = CascadeModel(graph=g, start_step=2)
+    m.frozen = {"a", "b"}
+    removed = merge_nodes(m, "a", "b")
+    assert "b" in removed and m.frozen == {"a"}
+
+
+def test_checkpoint_keeps_frozen_nodes_frozen_and_loads_old():
+    m = CascadeModel(start_step=2)
+    m.frozen.add("root")
+    m.nodes["root"].requires_grad_(False)
+    ckpt = m.checkpoint()
+    loaded = CascadeModel.from_checkpoint(ckpt)
+    assert loaded.frozen == {"root"}
+    assert not any(p.requires_grad for p in loaded.nodes["root"].parameters())
+    assert all(p.requires_grad for p in loaded.nodes["leaf0"].parameters())
+    del ckpt["frozen"]
+    assert CascadeModel.from_checkpoint(ckpt).frozen == set()
+
+
+def _freeze_run(tmp_path, extra):
+    import json
+    d = run(parse_args(["--dataset", "synthetic", "--model", "cascade", "--device", "cpu",
+                        "--epochs", "4", "--limit-batches", "2", "--grow-every", "1",
+                        "--max-nodes", "9", "--start-step", "2", "--no-report",
+                        "--runs-dir", str(tmp_path), *extra]))["run_dir"]
+    events = [json.loads(l) for l in (d / "growth.jsonl").read_text().splitlines()]
+    return events, torch.load(d / "model.pt")
+
+
+def test_freeze_routers_off_freezes_and_logs_nothing(tmp_path):
+    events, ckpt = _freeze_run(tmp_path, ["--freeze-entropy-max", "1.0", "--spread-min", "0"])
+    assert not any("freeze" in e for e in events) and ckpt["frozen"] == []
+
+
+def test_freeze_routers_freezes_ancestor_during_settle_epochs(tmp_path):
+    # only epoch 1 grows; the bars always pass, so root (ancestor from epoch 1) freezes after 2
+    events, ckpt = _freeze_run(tmp_path, ["--freeze-routers", "quality", "--settle-epochs", "3",
+                                          "--freeze-entropy-max", "1.0", "--spread-min", "0"])
+    freezes = [e for e in events if "freeze" in e]
+    assert [(e["epoch"], e["freeze"]) for e in freezes] == [(2, "root")]
+    assert set(freezes[0]) == {"epoch", "freeze", "entropy", "spread"}
+    assert max(e["epoch"] for e in events if "split" in e) == 1
+    assert ckpt["frozen"] == ["root"]
+
+
+@pytest.mark.parametrize("flags", [["--freeze-routers", "quality"],
+                                   ["--freeze-entropy-max", "0.5"]])
+def test_freeze_flags_are_cascade_only(tmp_path, flags):
+    with pytest.raises(SystemExit, match="--freeze-routers and --freeze-entropy-max only apply"):
+        run(parse_args(["--dataset", "synthetic", "--device", "cpu", "--limit-batches", "2",
+                        "--runs-dir", str(tmp_path), "--no-report", "--model", "dag", *flags]))
+
+
+def _eval_counts(m, rows=3):
+    m.train()
+    m.node_evals = m.rows_seen = m.trained_evals = 0
+    m.route(torch.randn(rows, 1, 28, 28))
+    return m.node_evals / m.rows_seen, m.trained_evals / m.rows_seen
+
+
+@pytest.mark.parametrize("prune", [0.0, 1e-9])
+def test_trained_evals_equal_node_evals_when_nothing_frozen(prune):
+    m = CascadeModel(start_step=2)
+    m.prune_reach = prune
+    nodes, trained = _eval_counts(m)
+    assert trained == nodes
+
+
+@pytest.mark.parametrize("prune", [0.0, 1e-9])
+def test_trained_evals_drop_by_one_when_root_frozen(prune):
+    m = CascadeModel(start_step=2)
+    m.prune_reach = prune
+    nodes, _ = _eval_counts(m)
+    m.nodes[m.graph.root].requires_grad_(False)
+    nodes2, trained = _eval_counts(m)
+    assert (nodes2, trained) == (nodes, nodes - 1)
+
+
+def test_run_logs_trained_node_evals_and_freezes(tmp_path):
+    import json
+    d = run(parse_args(["--dataset", "synthetic", "--model", "cascade", "--device", "cpu",
+                        "--epochs", "2", "--limit-batches", "2", "--no-report",
+                        "--runs-dir", str(tmp_path)]))["run_dir"]
+    rows = [json.loads(l) for l in (d / "metrics.jsonl").read_text().splitlines()]
+    assert all(r["trained_node_evals"] == r["node_evals"] and r["freezes"] == 0 for r in rows)
