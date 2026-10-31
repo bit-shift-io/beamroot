@@ -31,6 +31,9 @@
 - **Size axis** — Which dimensions follow the size step: `resolution` (image resolution and stem channels), `hidden` (hidden units) or `both`.
 - **Size check** — A test that a node can split its images: silhouette (at split), decisiveness and spread (after training), purity (optional, uses labels).
 - **Bump** — Rebuilding a node one size step up with fresh random weights after a failed size check. Not growing in place; trained weights are discarded.
+- **Leaf init** — How a cascade split's new classifier leaves start: `fresh` (random, default) or `copy` (the parent leaf plus `--split-noise`, as `dag` does). A bumped split and label leaves are always fresh.
+- **Settle epochs** — `--settle-epochs N`: no splits or bumps in the last N epochs, so every node trains at least N epochs after its last change.
+- **Bump cooldown** — `--bump-cooldown N`: the decisiveness and spread checks skip a router younger than N epochs, counted from its creation or last bump. Split-time bumps are not affected.
 - **Spread** — Share of a router's images going to its least-used child. Low spread means images are not actually split, however decisive the router is. Not the same as routing entropy.
 - **Classifier leaf** — Leaf with its own network over its input (a `dag` leaf, or a sized cascade leaf).
 - **Label leaf** — Cascade leaf with no network: a learned class distribution, started near-uniform with small random logits so routers get a gradient. The routers do all the classifying.

@@ -29,3 +29,9 @@
 - Checkpoints carry a model kind and a step per node; `load_run` dispatches on the kind.
 - Code that reads `model.stem` directly must go through `model.features(x)`.
 - The glossary's Stem entry applies to `dag` only.
+
+## Amendment 2026-10-31
+- Experiment 0004 added `--leaf-init copy`: new classifier leaves may start as copies of the parent leaf plus noise, as `dag` does. The default stays `fresh`, so "no leaf copies its parent" still holds by default. Routers are always fresh and pre-trained.
+- `--settle-epochs` and `--bump-cooldown` limit when splits and bumps happen. They do not change what a bump is (still a fresh rebuild).
+- Label leaves started exactly uniform and could not train (identical leaves give routers zero gradient); they now start at small random logits. Their results are in experiment 0004, which proposes dropping them.
+- Whether `copy` or `settle` become defaults is undecided and waits for more seeds.
