@@ -307,21 +307,29 @@ def _masked_leaf(old, fresh, keep: torch.Tensor, noise: float):
     return leaf
 
 
-def _pretrain_router(router, feats, labels, w, steps: int, lr: float) -> float:
+def _pretrain_router(router, feats, labels, w, steps: int, lr: float,
+                     chunk: int = 512) -> float:
     """Fit `router` to the group labels with reach-weighted cross-entropy, using a
-    throwaway Adam. Returns the final weighted loss."""
+    throwaway Adam. Each step is one full-batch update, accumulated over chunks so a big
+    cascade router fits in memory. Returns the final weighted loss."""
     opt = torch.optim.Adam(router.parameters(), lr=lr)
     w = w / w.sum().clamp(min=1e-12)
 
-    def loss_fn():
-        return -(w * router(feats).gather(1, labels[:, None]).squeeze(1)).sum()
+    def loss_fn(backward: bool) -> float:
+        total = 0.0
+        for s in range(0, len(feats), chunk):
+            e = s + chunk
+            loss = -(w[s:e] * router(feats[s:e]).gather(1, labels[s:e, None]).squeeze(1)).sum()
+            if backward:
+                loss.backward()
+            total += loss.item()
+        return total
     for _ in range(steps):
         opt.zero_grad()
-        loss = loss_fn()
-        loss.backward()
+        loss_fn(backward=True)
         opt.step()
     with torch.no_grad():
-        return loss_fn().item()
+        return loss_fn(backward=False)
 
 
 MAX_STEP = 4

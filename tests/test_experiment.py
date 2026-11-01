@@ -85,6 +85,24 @@ def test_variant_flags_reach_train_and_summary_groups_by_variant(tmp_path, monke
     assert "| dataset | variant | n |" in table
 
 
+def test_grid_interleaves_variants_within_each_seed(tmp_path, monkeypatch):
+    # Slow stretches on the machine (heat, day-to-day speed) then spread over all variants.
+    monkeypatch.setitem(experiment.GRIDS, "igrid", {
+        "datasets": ["synthetic"], "seeds": [0, 1],
+        "variants": {"small": ["--max-nodes", "3"], "big": ["--max-nodes", "5"]}})
+    seen = []
+    real_run = experiment.train.run
+
+    def spy(args):
+        seen.append((args.seed, args.max_nodes))
+        return real_run(args)
+
+    monkeypatch.setattr(experiment.train, "run", spy)
+    experiment.main(["igrid", "--epochs", "1", "--device", "cpu", "--limit-batches", "2",
+                     "--runs-dir", str(tmp_path)])
+    assert seen == [(0, 3), (0, 5), (1, 3), (1, 5)]
+
+
 def test_grid_epochs_per_dataset_unless_overridden(tmp_path, monkeypatch):
     monkeypatch.setitem(experiment.GRIDS, "egrid", {
         "datasets": ["synthetic"], "seeds": [0], "epochs": {"synthetic": 1}})
@@ -276,3 +294,17 @@ def test_cascadefreeze_grid_reuses_existing_variants_and_adds_freeze():
         "both-classifier-copy-settle-freeze": [*base, "--freeze-routers", "quality"],
         "both-classifier-copy-settle-decay-freeze": [
             *base, "--router-lr-decay", "0.5", "--freeze-routers", "quality"]}
+
+
+def test_cascadecifar_grid_reuses_mnist_variants_on_cifar10():
+    grid = experiment.GRIDS["cascadecifar"]
+    assert (grid["datasets"], grid["seeds"], grid["epochs"]) == (["cifar10"], [0], {"cifar10": 15})
+    init = experiment.GRIDS["cascadeinit"]["variants"]
+    assert grid["variants"] == {
+        "dag": experiment.GRIDS["cascade"]["variants"]["dag"],
+        "both-classifier-copy-settle": init["both-classifier-copy-settle"],
+        "resolution-classifier-copy": init["resolution-classifier-copy"],
+        "both-classifier-copy-settle-start4": [*init["both-classifier-copy-settle"],
+                                               "--start-step", "4"]}
+    flags = grid["variants"]["both-classifier-copy-settle-start4"]
+    assert experiment.train.parse_args(["--dataset", "cifar10", *flags]).start_step == 4

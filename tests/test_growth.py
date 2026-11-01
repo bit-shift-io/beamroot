@@ -701,3 +701,22 @@ def test_router_decay_sets_ancestor_lr_and_full_lr_elsewhere():
     del model.decay_start["root"]  # bumped
     set_router_lrs(model, opt, 1e-3, 0.5, epoch=6)
     assert all(g["lr"] == 1e-3 for g in opt.param_groups)
+
+
+def test_router_pretrain_runs_in_chunks_with_the_full_batch_update():
+    """A big cascade router fit on every collected image at once ran MPS out of memory
+    (CIFAR-10, start step 4); chunks must give the same full-batch fit."""
+    from beamroot.growth import _pretrain_router
+    from beamroot.models.dag import RouterNode
+    torch.manual_seed(0)
+    feats, labels, w = torch.randn(50, 8), torch.randint(0, 3, (50,)), torch.rand(50)
+    whole, chunked = RouterNode(8, 3), RouterNode(8, 3)
+    chunked.load_state_dict(whole.state_dict())
+    seen = []
+    chunked.register_forward_hook(lambda _m, inp, _o: seen.append(len(inp[0])))
+    loss_whole = _pretrain_router(whole, feats, labels, w, 20, 1e-2, chunk=1000)
+    loss_chunked = _pretrain_router(chunked, feats, labels, w, 20, 1e-2, chunk=16)
+    assert max(seen) <= 16
+    assert loss_chunked == pytest.approx(loss_whole, rel=1e-4)
+    for a, b in zip(whole.parameters(), chunked.parameters()):
+        assert torch.allclose(a, b, atol=1e-5)

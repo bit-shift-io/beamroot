@@ -86,6 +86,18 @@ GRIDS["cascadefreeze"] = {
         "both-classifier-copy-settle-freeze": [*_COPY_SETTLE, "--freeze-routers", "quality"],
         "both-classifier-copy-settle-decay-freeze": [
             *_COPY_SETTLE, "--router-lr-decay", "0.5", "--freeze-routers", "quality"]}}
+# Experiment 0006: does the cascade's cost/accuracy trade-off hold on CIFAR-10? dag, the best
+# cost point and the most accurate MNIST cascade, seed 0 first.
+GRIDS["cascadecifar"] = {
+    "datasets": ["cifar10"], "seeds": [0], "epochs": {"cifar10": 15},
+    "variants": {
+        "dag": GRIDS["cascade"]["variants"]["dag"],
+        "both-classifier-copy-settle": _COPY_SETTLE,
+        "resolution-classifier-copy":
+            GRIDS["cascadeinit"]["variants"]["resolution-classifier-copy"],
+        # Start every node at the largest size: do big cascade routers become decisive?
+        # The later --start-step wins in argparse.
+        "both-classifier-copy-settle-start4": [*_COPY_SETTLE, "--start-step", "4"]}}
 METRICS = ["beam1_acc", "beam3_acc", "soft_acc", "gap", "leaves", "mean_k", "links",
            "beam1_nodes", "split_router_entropy", "leaf_purity", "merges",
            "closest_merge_kl", "train_minutes", "beam1_macs", "beam1_ms", "bumps", "mean_step",
@@ -268,7 +280,8 @@ def main(argv=None) -> Path:
     exp_dir = Path(args.runs_dir) / (args.name or args.grid)
     exp_dir.mkdir(parents=True, exist_ok=True)
     runs = []
-    for dataset, variant, seed in product(args.datasets, args.variants, args.seeds):
+    # Seeds outer, variants inner: a slow stretch on the machine hits every variant alike.
+    for dataset, seed, variant in product(args.datasets, args.seeds, args.variants):
         name = run_name(dataset, seed, variant)
         run_dir = finished_run(exp_dir, name)
         if run_dir is None:
