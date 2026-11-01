@@ -341,7 +341,7 @@ def test_grow_splits_a_tree_leaf_on_its_confusion_groups_at_a_well_routed_block(
                  val_loader=val, route_acc_min=0.9)
     assert event["split"] == "root" and event["groups"] == GROUPS
     assert list(event["block_val_acc"]) == ["b1", "b2", "b3", "b4"]
-    assert event["fallback"] is None
+    assert event["fallback"] is None and event["excluded_blocks"] == ["b4"]
     assert event["block_val_acc"][event["block"]] >= 0.9
     assert all(event["block_val_acc"][b] < 0.9 for b in event["block_val_acc"]
                if b < event["block"])
@@ -416,3 +416,210 @@ def test_router_head_pool_matches_adaptive_pool_and_runs_on_mps(size):
     if torch.backends.mps.is_available():
         out = head.to("mps")(x.to("mps")).cpu()
         assert torch.allclose(out, head.cpu()(x), atol=1e-5)
+
+
+def test_a_root_below_the_bar_is_not_split_until_a_later_step_passes(tmp_path):
+    from beamroot.growth import grow
+    train, val = group_data()
+    tree = trained_leaf(train)
+    torch.manual_seed(123)
+    cpu, shuffle = torch.get_rng_state(), train.generator.get_state()
+    skip = grow(tree, train, "cpu", 1, tmp_path, max_nodes=3, limit_batches=6,
+                val_loader=val, route_acc_min=1.01)  # no block can reach it
+    assert torch.equal(torch.get_rng_state(), cpu)  # the skip path leaves the RNG too
+    assert torch.equal(train.generator.get_state(), shuffle)
+    assert skip["skipped"] == "root_below_bar" and "split" not in skip
+    assert skip["leaf"] == "root" and skip["groups"] == GROUPS
+    assert list(skip["block_val_acc"]) == ["b1", "b2", "b3", "b4"]
+    assert list(tree.graph.nodes) == ["root"] and tree.split_blocks == {}
+    assert not (tmp_path / "graphs").exists()
+    event = grow(tree, train, "cpu", 2, tmp_path, max_nodes=3, limit_batches=6,
+                 val_loader=val, route_acc_min=0.9)
+    assert event["split"] == "root" and event["fallback"] is None
+    logged = [json.loads(s) for s in (tmp_path / "growth.jsonl").read_text().splitlines()]
+    assert [e.get("skipped") for e in logged] == ["root_below_bar", None]
+    assert logged[0]["epoch"] == 1 and logged[0]["block_val_acc"] == skip["block_val_acc"]
+
+
+def test_a_non_root_leaf_below_the_bar_falls_back_to_the_last_block(tmp_path):
+    from beamroot.growth import grow, tree_split
+    train, val = group_data()
+    tree = trained_leaf(train, steps=1)
+    tree_split(tree, "root", GROUPS, "b2")
+    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=5, limit_batches=6,
+                 val_loader=val, route_acc_min=1.01)
+    assert event["split"] in ("leaf0", "leaf1")
+    assert event["block"] == "b4" and event["fallback"] == "last_block"
+
+
+def test_train_run_keeps_the_plain_network_while_the_root_misses_the_bar(tmp_path, capsys):
+    d = run(parse_args(["--dataset", "synthetic_cifar", "--model", "tree", "--device", "cpu",
+                        "--epochs", "3", "--width", "4", "--limit-batches", "2",
+                        "--route-acc-min", "1.01", "--runs-dir", str(tmp_path)]))["run_dir"]
+    events = [json.loads(s) for s in (d / "growth.jsonl").read_text().splitlines()]
+    assert [(e["epoch"], e["skipped"]) for e in events] == [(1, "root_below_bar"),
+                                                            (2, "root_below_bar")]
+    model, _ = load_run(d, "cpu")
+    assert list(model.nodes) == ["root"]
+    assert "root below route acc 1.01" in capsys.readouterr().out
+
+
+def test_choose_root_block_never_picks_the_last_block():
+    from beamroot.growth import choose_root_block
+    accs = {"b1": 0.90, "b2": 0.91, "b3": 0.92, "b4": 0.95}
+    assert choose_root_block(accs, 0.93) is None  # only b4 passes: skip
+    assert choose_root_block({**accs, "b2": 0.94}, 0.93) == "b2"
+
+
+def test_keep_channels_keeps_the_fewest_channels_carrying_the_share():
+    from beamroot.growth import keep_channels
+    mass = torch.tensor([5.0, 0.0, 3.0, 1.0, 0.0, 1.0])
+    assert keep_channels(mass, 0.95).tolist() == [0, 2, 3, 5]
+    assert keep_channels(mass, 0.5).tolist() == [0]
+    assert keep_channels(mass, 0.8).tolist() == [0, 2]
+    assert keep_channels(mass, 1.0).tolist() == [0, 1, 2, 3, 4, 5]  # full copy
+    assert keep_channels(torch.zeros(4), 0.95).tolist() == [0]  # never drop every channel
+
+
+def silence(conv, channels):
+    """Make output `channels` of `conv` zero after its ReLU, for every input."""
+    with torch.no_grad():
+        conv.weight[channels] = 0
+        conv.bias[channels] = -1
+
+
+def narrowed_tree(x):
+    """Width-4 tree (4/8/16/32/32 channels per conv) split at b2; leaf0 drops channels that
+    are zero for every input, leaf1 keeps all. Returns the tree and the root's output on x
+    before the split."""
+    from beamroot.growth import tree_split
+    torch.manual_seed(0)
+    tree = cifar_tree(width=4)
+    b3, b4 = tree.nodes["root"].segment[2], tree.nodes["root"].segment[3]
+    silence(b3[0], [1, 5])
+    silence(b4[0], [0, 3, 7])
+    silence(b4[2], [2])
+    with torch.no_grad():
+        before = tree.nodes["root"](x)
+
+    def drop(n, gone):
+        return torch.tensor([c for c in range(n) if c not in gone])
+
+    keep = [[drop(16, [1, 5]), drop(32, [0, 3, 7]), drop(32, [2])],
+            [torch.arange(16), torch.arange(32), torch.arange(32)]]
+    tree_split(tree, "root", GROUPS, "b2", keep=keep)
+    return tree, before
+
+
+def test_a_narrowed_branch_equals_the_full_branch_when_dropped_channels_are_zero():
+    x = torch.randn(5, 3, 32, 32)
+    tree, before = narrowed_tree(x)
+    narrow, full = "leaf0", "leaf1"
+    convs = [m for m in tree.nodes[narrow].segment.modules() if isinstance(m, nn.Conv2d)]
+    assert [(c.in_channels, c.out_channels) for c in convs] == [(8, 14), (14, 29), (29, 31)]
+    assert tree.nodes[narrow].head.linear.in_features == 31
+    with torch.no_grad():
+        cache = tree.node_cache(x)
+        assert torch.allclose(cache.output(narrow), before, atol=1e-5)
+        assert torch.allclose(cache.output(full), before, atol=1e-6)
+
+
+def test_narrowed_branches_round_trip_through_load_run(tmp_path):
+    from beamroot.growth import tree_split
+    x = torch.randn(4, 3, 32, 32)
+    tree, _ = narrowed_tree(x)
+    tree_split(tree, "leaf0", [[0, 1], [2, 3, 4]], "b3",  # the router keeps leaf0's 14 b3 channels
+               keep=[[torch.arange(10), torch.arange(5)], [torch.arange(29), torch.arange(31)]])
+    torch.save(tree.checkpoint(), tmp_path / "model.pt")
+    (tmp_path / "config.json").write_text(json.dumps({"dataset": "cifar10"}))
+    back, _ = load_run(tmp_path, "cpu")
+    assert {k: v.shape for k, v in back.state_dict().items()} == \
+        {k: v.shape for k, v in tree.state_dict().items()}
+    assert torch.equal(tree.eval()(x), back(x))
+
+
+def test_a_checkpoint_without_channel_widths_still_loads(tmp_path):
+    tree = split_tree("b3", width=4)
+    ckpt = tree.checkpoint()
+    ckpt.pop("channels", None)  # written before branch keep existed
+    torch.save(ckpt, tmp_path / "model.pt")
+    (tmp_path / "config.json").write_text(json.dumps({"dataset": "cifar10"}))
+    back, _ = load_run(tmp_path, "cpu")
+    x = torch.randn(4, 3, 32, 32)
+    assert torch.equal(tree(x), back(x))
+
+
+def test_beam_one_macs_of_each_path_use_that_branchs_width():
+    x = torch.randn(1, 3, 32, 32)
+    tree, _ = narrowed_tree(x)
+    _, nodes = model_costs(tree)
+    img = torch.zeros(1, 3, 32, 32)
+    with torch.no_grad():
+        trunk_out = tree.nodes["root"].segment(img)
+    for leaf in ("leaf0", "leaf1"):
+        assert nodes[leaf] == module_macs(tree.nodes[leaf], trunk_out)
+    assert nodes["leaf0"] < nodes["leaf1"]  # leaf1 is a full copy, leaf0 narrowed
+    full = cifar_tree(width=4)
+    assert nodes["leaf1"] + nodes["root"] > model_costs(full)[1]["root"]  # plus router head
+    with torch.no_grad():  # route every image to leaf0
+        tree.nodes["root"].head.net[-1].bias.copy_(torch.tensor([100.0, -100.0]))
+    (res,) = beam_search(tree, x, 1)
+    assert res.evaluated == ["root", "leaf0"]
+
+
+def test_grow_narrows_each_branch_to_its_groups_activation_share_and_logs_it(tmp_path):
+    from beamroot.growth import grow
+    train, val = group_data()
+    tree = trained_leaf(train)
+    silence(tree.nodes["root"].segment[3][2], list(range(16)))  # half of b4's last conv
+    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=3, limit_batches=6,
+                 val_loader=val, route_acc_min=0.9, branch_keep=0.95)
+    new = event["new_nodes"]
+    assert event["branch_keep"] == 0.95
+    assert set(event["branch_channels"]) == set(new)
+    for leaf in new:
+        kept, full = event["branch_channels"][leaf], tree.default_widths(leaf)
+        assert kept == tree.node_widths(leaf) and len(kept) == len(full)
+        assert all(1 <= k <= f for k, f in zip(kept, full))
+        assert kept[-1] <= 16  # a channel no image activates is always dropped
+    _, nodes = model_costs(tree)
+    assert event["branch_macs"] == {leaf: nodes[leaf] for leaf in new}
+    logged = json.loads((tmp_path / "growth.jsonl").read_text().splitlines()[-1])
+    assert logged["branch_channels"] == event["branch_channels"]
+    x, _ = next(iter(val))
+    assert tree.eval()(x).shape == (len(x), 10)
+
+
+def test_grow_with_branch_keep_one_copies_the_branches_at_full_width(tmp_path):
+    from beamroot.growth import grow
+    train, val = group_data()
+    tree = trained_leaf(train)
+    x, _ = next(iter(val))
+    with torch.no_grad():
+        before = tree.eval().nodes["root"](x)
+    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=3, limit_batches=6,
+                 val_loader=val, route_acc_min=0.9, branch_keep=1.0)
+    assert tree.channels == {}
+    with torch.no_grad():
+        for leaf in event["new_nodes"]:
+            assert event["branch_channels"][leaf] == tree.default_widths(leaf)
+            assert torch.equal(tree.node_cache(x).output(leaf), before)
+
+
+def test_branch_keep_exits_for_other_models(tmp_path):
+    with pytest.raises(SystemExit, match="tree"):
+        run(parse_args(["--dataset", "synthetic", "--device", "cpu", "--epochs", "1",
+                        "--branch-keep", "0.9", "--runs-dir", str(tmp_path)]))
+    assert not list(tmp_path.iterdir())
+
+
+def test_train_run_passes_branch_keep_to_tree_growth(tmp_path, capsys):
+    d = run(parse_args(["--dataset", "synthetic_cifar", "--model", "tree", "--device", "cpu",
+                        "--epochs", "2", "--width", "4", "--max-nodes", "3",
+                        "--route-acc-min", "0.5", "--branch-keep", "0.5",
+                        "--runs-dir", str(tmp_path)]))["run_dir"]
+    (event,) = [json.loads(s) for s in (d / "growth.jsonl").read_text().splitlines()]
+    assert event["branch_keep"] == 0.5
+    model, _ = load_run(d, "cpu")
+    assert {n: model.node_widths(n) for n in event["new_nodes"]} == event["branch_channels"]
+    assert "channels" in capsys.readouterr().out

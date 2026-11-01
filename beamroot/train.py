@@ -141,6 +141,8 @@ def run(args, after_epoch=None) -> dict:
     is rebuilt."""
     if args.model != "tree" and args.route_acc_min != 0.93:
         raise SystemExit("--route-acc-min only applies to --model tree")
+    if args.model != "tree" and args.branch_keep != 0.95:
+        raise SystemExit("--branch-keep only applies to --model tree")
     if args.model == "tree":
         if args.merge:
             raise SystemExit("--merge does not apply to --model tree")
@@ -259,7 +261,13 @@ def run(args, after_epoch=None) -> dict:
                          silhouette_min=(args.silhouette_min if args.model == "cascade"
                                          else None),
                          purity_gain=(args.purity_gain if args.purity_check else None),
-                         leaf_init=args.leaf_init, route_acc_min=args.route_acc_min)
+                         leaf_init=args.leaf_init, route_acc_min=args.route_acc_min,
+                         branch_keep=args.branch_keep)
+            if event and event.get("skipped"):  # tree root missed the bar: nothing changed
+                accs = {b: round(a, 3) for b, a in event["block_val_acc"].items()}
+                print(f"  no split: {event['leaf']} below route acc {args.route_acc_min} "
+                      f"groups {event['groups']} route acc {accs}", flush=True)
+                event = None
             fresh = event["new_nodes"] if event else []  # fresh leaves only, not linked ones
             if event or merges or any('to' in b for b in bumps):
                 opt = rebuild_optimizer(model, opt, lr=args.lr)
@@ -268,6 +276,9 @@ def run(args, after_epoch=None) -> dict:
                 print(f"  split {event['split']} -> {event['new_nodes']} at {event['block']} "
                       f"groups {event['groups']} route acc {accs} "
                       f"fallback {event['fallback']} ({event['num_nodes']} nodes)", flush=True)
+                for n in event["new_nodes"]:
+                    print(f"    {n} channels {event['branch_channels'][n]} "
+                          f"MACs {event['branch_macs'][n] / 1e6:.2f}M", flush=True)
             elif event:
                 print(f"  split {event['split']} -> {event['new_nodes']} (k {event['k']}) "
                       f"({event['num_nodes']} nodes)", flush=True)
@@ -383,6 +394,10 @@ def parse_args(argv=None):
                    help="tree only: split at the earliest block whose probe head routes the "
                         "confusion groups with at least this validation accuracy (else the "
                         "last block)")
+    p.add_argument("--branch-keep", type=float, default=0.95,
+                   help="tree only: at a split each branch keeps, per conv, the fewest "
+                        "channels carrying this share of its group's activation mass "
+                        "(1.0 copies the parent's blocks at full width)")
     p.add_argument("--growth-batches", type=int, default=50,
                    help="training batches used to measure per-leaf loss and to cluster "
                         "the chosen leaf's images before a split (and validation batches "

@@ -10,14 +10,33 @@ def _conv(i: int, o: int) -> list[nn.Module]:
     return [nn.Conv2d(i, o, 3, padding=1), nn.ReLU()]
 
 
+CONVS = (1, 1, 1, 2)  # convs per `deep4` block
+
+
+def deep4_widths(width: int = 16) -> list[int]:
+    """Output channels of each conv of the full `deep4` network, in order."""
+    return [width, width * 2, width * 4, width * 8, width * 8]
+
+
+def deep4_segment(in_channels: int, start: int, end: int, widths: list[int]
+                  ) -> list[nn.Sequential]:
+    """`deep4` blocks `start` to `end - 1` reading `in_channels`, with `widths` the output
+    channels of each of their convs, in order (no BatchNorm: convs carry every
+    per-channel parameter)."""
+    blocks, i = [], 0
+    for b in range(start, end):
+        layers = []
+        for _ in range(CONVS[b]):
+            layers += _conv(in_channels, widths[i])
+            in_channels, i = widths[i], i + 1
+        blocks.append(nn.Sequential(*layers, nn.MaxPool2d(2)))
+    return blocks
+
+
 def deep4_blocks(in_channels: int, width: int = 16) -> list[nn.Sequential]:
     """The `deep4` conv blocks of experiment 0007: width x (1, 2, 4, 8) channels, each block
     halving the spatial size; the last block has two convs. Width 16 gives 16/32/64/128."""
-    c = [width, width * 2, width * 4, width * 8]
-    return [nn.Sequential(*_conv(in_channels, c[0]), nn.MaxPool2d(2)),
-            nn.Sequential(*_conv(c[0], c[1]), nn.MaxPool2d(2)),
-            nn.Sequential(*_conv(c[1], c[2]), nn.MaxPool2d(2)),
-            nn.Sequential(*_conv(c[2], c[3]), *_conv(c[3], c[3]), nn.MaxPool2d(2))]
+    return deep4_segment(in_channels, 0, len(CONVS), deep4_widths(width))
 
 
 class Classifier(nn.Module):
@@ -119,13 +138,18 @@ class TreeModel(nn.Module):
     segment starts after its parent's split block and ends at its own split block (router)
     or the last block (leaf). Built by `growth.tree_split`.
 
+    Branch widths: `channels[node]` lists the output channels of each conv of the node's
+    segment, for nodes narrowed by branch keep; other nodes have `deep4`'s widths
+    (`node_widths`). A node's segment reads its parent's last conv width.
+
     `forward` returns log-probabilities over classes, like `DAGRouterModel`.
     """
 
     def __init__(self, graph: RouterGraph | None = None, in_channels: int = 3,
                  image_size: int = 32, num_classes: int = 10, width: int = 16,
                  split_blocks: dict[str, str] | None = None,
-                 groups: dict[str, list[list[int]]] | None = None):
+                 groups: dict[str, list[list[int]]] | None = None,
+                 channels: dict[str, list[int]] | None = None):
         super().__init__()
         self.config = {"in_channels": in_channels, "image_size": image_size,
                        "num_classes": num_classes, "width": width}
@@ -136,6 +160,7 @@ class TreeModel(nn.Module):
         self.graph = graph
         self.split_blocks = dict(split_blocks or {})
         self.groups = {r: [list(g) for g in gs] for r, gs in (groups or {}).items()}
+        self.channels = {n: list(w) for n, w in (channels or {}).items()}
         self.nodes = nn.ModuleDict()
         for name in self.graph.topological_order():
             self.nodes[name] = self.build_node(name)
@@ -152,19 +177,54 @@ class TreeModel(nn.Module):
             return list(range(self.num_classes))
         return self.groups[parents[0]][self.graph.children(parents[0]).index(name)]
 
-    def build_node(self, name: str) -> TreeNode:
-        """A freshly initialised node: its segment of `deep4`'s blocks, then a `Classifier`
-        (leaf) or a `RouterHead` on its split block's output (router)."""
-        cfg = self.config
-        blocks = deep4_blocks(cfg["in_channels"], cfg["width"])
-        start = self.start_block(name)
+    def end_block(self, name: str) -> int:
+        """Index in `BLOCKS` one past the last block node `name`'s segment owns."""
         if self.graph.nodes[name].kind == "leaf":
-            return TreeNode(nn.Sequential(*blocks[start:]),
-                            Classifier(cfg["width"] * 8, cfg["num_classes"]))
-        end = BLOCKS.index(self.split_blocks[name])
-        head = RouterHead(cfg["width"] * 2 ** end, cfg["image_size"] // 2 ** (end + 1),
+            return len(BLOCKS)
+        return BLOCKS.index(self.split_blocks[name]) + 1
+
+    def default_widths(self, name: str) -> list[int]:
+        """`deep4`'s conv widths over node `name`'s segment."""
+        lo = sum(CONVS[:self.start_block(name)])
+        return deep4_widths(self.config["width"])[lo:sum(CONVS[:self.end_block(name)])]
+
+    def node_widths(self, name: str) -> list[int]:
+        """Output channels of each conv of node `name`'s segment, in order."""
+        return list(self.channels.get(name, self.default_widths(name)))
+
+    def set_widths(self, name: str, widths: list[int]) -> None:
+        """Record node `name`'s conv widths (kept only where they differ from `deep4`'s)."""
+        if list(widths) == self.default_widths(name):
+            self.channels.pop(name, None)
+        else:
+            self.channels[name] = list(widths)
+
+    def in_width(self, name: str) -> int:
+        """Channels of node `name`'s input: the image's, or its parent's last conv's."""
+        parents = self.graph.parents(name)
+        return self.node_widths(parents[0])[-1] if parents else self.config["in_channels"]
+
+    def out_width(self, name: str) -> int:
+        """Channels of node `name`'s segment output (its input's if it owns no blocks)."""
+        widths = self.node_widths(name)
+        return widths[-1] if widths else self.in_width(name)
+
+    def block_width(self, name: str, block: int) -> int:
+        """Output channels of block index `block` of node `name`'s segment."""
+        return self.node_widths(name)[sum(CONVS[self.start_block(name):block + 1]) - 1]
+
+    def build_node(self, name: str) -> TreeNode:
+        """A freshly initialised node: its segment of `deep4`'s blocks at its widths, then
+        a `Classifier` (leaf) or a `RouterHead` on its split block's output (router)."""
+        cfg = self.config
+        start, end = self.start_block(name), self.end_block(name)
+        segment = nn.Sequential(*deep4_segment(self.in_width(name), start, end,
+                                               self.node_widths(name)))
+        if self.graph.nodes[name].kind == "leaf":
+            return TreeNode(segment, Classifier(self.out_width(name), cfg["num_classes"]))
+        head = RouterHead(self.out_width(name), cfg["image_size"] // 2 ** end,
                           len(self.graph.children(name)))
-        return TreeNode(nn.Sequential(*blocks[start:end + 1]), head)
+        return TreeNode(segment, head)
 
     def node_cache(self, x: torch.Tensor) -> NodeCache:
         return NodeCache(self, x)
@@ -233,11 +293,12 @@ class TreeModel(nn.Module):
     def checkpoint(self) -> dict:
         return {"kind": "tree", "config": self.config, "graph": self.graph.to_dict(),
                 "split_blocks": dict(self.split_blocks), "groups": self.groups,
-                "state_dict": self.state_dict()}
+                "channels": dict(self.channels), "state_dict": self.state_dict()}
 
     @classmethod
     def from_checkpoint(cls, ckpt: dict) -> "TreeModel":
         model = cls(graph=RouterGraph.from_dict(ckpt["graph"]), **ckpt["config"],
-                    split_blocks=ckpt.get("split_blocks"), groups=ckpt.get("groups"))
+                    split_blocks=ckpt.get("split_blocks"), groups=ckpt.get("groups"),
+                    channels=ckpt.get("channels"))
         model.load_state_dict(ckpt["state_dict"])
         return model
