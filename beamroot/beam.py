@@ -46,18 +46,25 @@ class _Entry:
 
 
 def beam_search(model, x: torch.Tensor, beam: int) -> list[BeamResult]:
-    """Beam search for each image in batch `x`; the Stem runs once per batch."""
+    """Beam search for each image in batch `x`; the Stem (or, for a tree, each node's
+    segment, through `model.node_cache`) runs once per batch."""
     if beam < 1:
         raise ValueError("beam must be >= 1")
     graph = model.graph
     descendants = {n: graph.descendants(n) for n in graph.nodes}
     with torch.no_grad():
+        if hasattr(model, "node_cache"):  # tree: a node's input depends on its path
+            cache = model.node_cache(x)
+            return [_search_one(model, lambda n, i=i: cache.output(n)[i:i + 1], beam, descendants)
+                    for i in range(x.shape[0])]
         feats = model.features(x)
-        return [_search_one(model, feats[i:i + 1], beam, descendants)
+        return [_search_one(model, lambda n, f=feats[i:i + 1]: model.nodes[n](f), beam,
+                            descendants)
                 for i in range(feats.shape[0])]
 
 
-def _search_one(model, feats, beam, descendants) -> BeamResult:
+def _search_one(model, run, beam, descendants) -> BeamResult:
+    """`run(name)` gives node `name`'s output for this one image."""
     graph = model.graph
     root = graph.root
     frontier = {root: _Entry(1.0, [root], 1.0)}
@@ -69,7 +76,7 @@ def _search_one(model, feats, beam, descendants) -> BeamResult:
             break
         for name in ready:
             entry = frontier.pop(name)
-            route = model.nodes[name](feats)[0].exp().tolist()
+            route = run(name)[0].exp().tolist()
             evaluated.append(name)
             for child, p in zip(graph.children(name), route):
                 path_prob = entry.best_prob * p
@@ -85,7 +92,7 @@ def _search_one(model, feats, beam, descendants) -> BeamResult:
     paths, mix = [], 0
     total = sum(e.prob for e in frontier.values())
     for leaf, entry in frontier.items():
-        leaf_probs = F.softmax(model.nodes[leaf](feats)[0], dim=0)
+        leaf_probs = F.softmax(run(leaf)[0], dim=0)
         evaluated.append(leaf)
         mix = mix + (entry.prob / total) * leaf_probs
         paths.append(BeamPath(leaf, entry.best_path, entry.prob, entry.best_prob,

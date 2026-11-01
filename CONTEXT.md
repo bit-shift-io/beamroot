@@ -41,3 +41,10 @@
 - **Classifier leaf** — Leaf with its own network over its input (a `dag` leaf, or a sized cascade leaf).
 - **Label leaf** — Cascade leaf with no network: a learned class distribution, started near-uniform with small random logits so routers get a gradient. The routers do all the classifying.
 - **Pruned soft routing** — Cascade training where an image skips a node once its reach falls below `--prune-reach`. Not hard routing: every kept branch still gets its reach-weighted gradient.
+- **Tree model** — Model kind (`--model tree`) that grows a tree inside one plain conv network. Each child continues from its parent's feature maps at the split block (ADR 0006). Not the `dag` model (splits only on heads over a fixed stem) and not a cascade (nodes read the raw image). No merges or links.
+- **Segment** — The conv blocks a tree node owns: from its parent's split block to its own split block (a router) or to the classifier (a leaf).
+- **Split block** — The block whose output a tree router reads and its children continue from. Chosen at split time as the earliest block that routes the groups well.
+- **Confusion groups** — The two class groups of a tree split: the top cut of average-linkage clustering on the leaf's symmetric validation confusion. Supervised; not the cluster split policy.
+- **Route accuracy** — Share of validation images a router sends to the group of their true class. Chooses the split block (`--route-acc-min`).
+- **Branch keep** — `--branch-keep S`: at a tree split, each branch keeps the fewest channels per layer that carry share S of its group's activation mass. 1.0 is a full copy.
+- **Teacher forcing** — Tree training where routers learn their group labels and each image trains only the nodes on its true path. Beam-1 at test may misroute; that image is then lost.

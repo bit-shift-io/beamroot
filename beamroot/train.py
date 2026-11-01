@@ -6,6 +6,7 @@ from itertools import islice
 import torch
 import torch.nn.functional as F
 
+from beamroot.analysis import collect_stats, purity
 from beamroot.data import dataset_info, get_loaders
 from beamroot.device import select_device
 from beamroot.growth import (_log_event, freeze_checks, grow, merge_step, node_param_groups,
@@ -14,6 +15,7 @@ from beamroot.losses import balance_loss, path_loss, router_usage, routing_entro
 from beamroot.models.baseline import BaselineCNN, count_params, match_width
 from beamroot.models.cascade import CascadeModel
 from beamroot.models.dag import DAGRouterModel
+from beamroot.models.tree import TreeModel
 from beamroot.runs import create_run_dir, log_metrics
 
 # Growth presets (experiment 0002, ADR 0004). Explicit --max-k / --split-policy /
@@ -39,7 +41,8 @@ def train_epoch(model, loader, opt, device, limit_batches=None, balance_weight=0
                 parts=None):
     """Returns the list of per-step losses (cross-entropy + weighted balance loss).
 
-    DAG models train on the path loss (ADR 0003); baselines on plain cross-entropy.
+    DAG models train on the path loss (ADR 0003); tree models on the teacher-forced loss
+    (`TreeModel.teacher_forced_loss`, no balance loss); baselines on plain cross-entropy.
     For DAG models, `stats` (a dict) is filled with per-router mean usage and entropy,
     and `parts` (a dict) with the mean "ce" (path loss) and "balance" components of the loss.
     """
@@ -52,7 +55,9 @@ def train_epoch(model, loader, opt, device, limit_batches=None, balance_weight=0
     for x, y in islice(loader, limit_batches):
         opt.zero_grad()
         y = y.to(device)
-        if isinstance(model, DAGRouterModel):
+        if isinstance(model, TreeModel):
+            loss = model.teacher_forced_loss(x.to(device), y)
+        elif isinstance(model, DAGRouterModel):
             out = model.route(x.to(device))
             ce = path_loss(out["log_reach"], out["leaf_log_probs"], y)
             loss, bal = ce, 0.0
@@ -98,6 +103,8 @@ def build_model(name: str, dataset: str = "mnist", width: int | None = None,
         return DAGRouterModel(**dims)
     if name == "cascade":
         return CascadeModel(**dims, size_axis=size_axis, start_step=start_step, leaf=leaf)
+    if name == "tree":
+        return TreeModel(**dims)
     raise ValueError(f"unknown model {name!r}")
 
 
@@ -110,13 +117,37 @@ def matched_size(run_dir, dataset: str) -> tuple[int, int]:
 
 
 def save_payload(model):
-    """DAG checkpoints carry graph structure + config; baseline stays a plain state_dict."""
-    if isinstance(model, DAGRouterModel):
+    """DAG and tree checkpoints carry graph structure + config; baseline stays a plain
+    state_dict."""
+    if isinstance(model, (DAGRouterModel, TreeModel)):
         return model.checkpoint()
     return model.state_dict()
 
 
-def run(args) -> dict:
+def tree_routing(model, loader, device, limit_batches=None) -> dict:
+    """Soft routing stats of a tree on `loader`: per router its "usage" (reach-weighted mean
+    child probabilities) and "entropy"; per leaf its "purity" (dominant class share)."""
+    stats = collect_stats(model, loader, device, model.num_classes, limit_batches)
+    out = {r: {"usage": [stats["edge_prob"][(r, c)] for c in model.graph.children(r)],
+               "entropy": stats["entropy"][r]} for r in model.graph.routers()}
+    for leaf in model.graph.leaves():
+        out[leaf] = {"purity": purity(stats["class_mass"][leaf])[1]}
+    return out
+
+
+def run(args, after_epoch=None) -> dict:
+    """Train one run. `after_epoch(model, epoch) -> bool` (a test seam, e.g. a manual tree
+    split) runs after each epoch's metrics; True means the model changed, so the optimiser
+    is rebuilt."""
+    if args.model != "tree" and args.route_acc_min != 0.93:
+        raise SystemExit("--route-acc-min only applies to --model tree")
+    if args.model == "tree":
+        if args.merge:
+            raise SystemExit("--merge does not apply to --model tree")
+        if args.link_policy != "none":
+            raise SystemExit("--link-policy does not apply to --model tree")
+        if args.size_axis != "both" or args.start_step != 4:
+            raise SystemExit("--size-axis and --start-step only apply to --model cascade")
     if args.model == "cascade":
         if args.merge:
             raise SystemExit("--merge does not apply to --model cascade")
@@ -155,7 +186,7 @@ def run(args) -> dict:
         opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     config = {**vars(args), "resolved_device": str(device), "params": count_params(model)}
     run_dir = create_run_dir(args.name or f"{args.dataset}-{args.model}", args.runs_dir, config)
-    growing = isinstance(model, DAGRouterModel) and args.grow_every > 0
+    growing = isinstance(model, (DAGRouterModel, TreeModel)) and args.grow_every > 0
     if growing:
         save_graph_snapshot(model, run_dir, 0)
     first_loss, last = None, {}
@@ -170,6 +201,8 @@ def run(args) -> dict:
         if first_loss is None:
             first_loss = losses[0]
         acc = evaluate(model, test_loader, device, args.limit_batches)
+        if isinstance(model, TreeModel):  # teacher forcing gives no soft routing stats
+            stats = tree_routing(model, test_loader, device, args.limit_batches)
         last = {"epoch": epoch, "loss": sum(losses) / len(losses),
                 "test_acc": acc, "seconds": time.time() - t0}
         if parts:
@@ -184,9 +217,13 @@ def run(args) -> dict:
             last["num_nodes"] = len(model.graph.nodes)
         log_metrics(run_dir, last)
         for name, s in stats.items():
+            if "usage" not in s:  # tree leaves carry only purity
+                continue
             print(f"  {name}: usage {[round(v, 3) for v in s['usage']]} "
                   f"entropy {s['entropy']:.3f}", flush=True)
         print(f"epoch {epoch}: loss {last['loss']:.4f} test_acc {acc:.4f}", flush=True)
+        if after_epoch is not None and after_epoch(model, epoch):
+            opt = rebuild_optimizer(model, opt, lr=args.lr)
         # Freeze before size checks and growth; settle epochs do not block it.
         if args.model == "cascade" and args.freeze_routers == "quality" and epoch < args.epochs:
             for f in freeze_checks(model, stats, args.freeze_entropy_max, args.spread_min):
@@ -222,11 +259,16 @@ def run(args) -> dict:
                          silhouette_min=(args.silhouette_min if args.model == "cascade"
                                          else None),
                          purity_gain=(args.purity_gain if args.purity_check else None),
-                         leaf_init=args.leaf_init)
+                         leaf_init=args.leaf_init, route_acc_min=args.route_acc_min)
             fresh = event["new_nodes"] if event else []  # fresh leaves only, not linked ones
             if event or merges or any('to' in b for b in bumps):
                 opt = rebuild_optimizer(model, opt, lr=args.lr)
-            if event:
+            if event and isinstance(model, TreeModel):
+                accs = {b: round(a, 3) for b, a in event["block_val_acc"].items()}
+                print(f"  split {event['split']} -> {event['new_nodes']} at {event['block']} "
+                      f"groups {event['groups']} route acc {accs} "
+                      f"fallback {event['fallback']} ({event['num_nodes']} nodes)", flush=True)
+            elif event:
                 print(f"  split {event['split']} -> {event['new_nodes']} (k {event['k']}) "
                       f"({event['num_nodes']} nodes)", flush=True)
                 if "cluster_sizes" in event:
@@ -248,7 +290,7 @@ def run(args) -> dict:
                 print(f"wrote {path}", flush=True)
             print((run_dir / "flow.txt").read_text(), flush=True)
         else:
-            from beamroot.analysis import class_flow, collect_stats
+            from beamroot.analysis import class_flow
             stats = collect_stats(model, test_loader, device, model.num_classes,
                                   args.limit_batches)
             print(class_flow(model.graph, stats["class_mass"],
@@ -260,7 +302,7 @@ def run(args) -> dict:
 def parse_args(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", default="mnist", choices=["mnist", "synthetic", "cifar10", "synthetic_cifar"])
-    p.add_argument("--model", default="dag", choices=["dag", "baseline", "cascade"])
+    p.add_argument("--model", default="dag", choices=["dag", "baseline", "cascade", "tree"])
     p.add_argument("--device", default=None, help="mps or cpu (default: mps if available)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--epochs", type=int, default=None, help="default depends on the dataset")
@@ -317,9 +359,9 @@ def parse_args(argv=None):
     p.add_argument("--balance-weight", type=float, default=0.1,
                    help="load-balancing loss weight for dag models (0 disables)")
     p.add_argument("--grow-every", type=int, default=1,
-                   help="dag only: split the worst leaf every K epochs (0 disables)")
+                   help="dag and tree: split the worst leaf every K epochs (0 disables)")
     p.add_argument("--max-nodes", type=int, default=7,
-                   help="dag only: stop growing when a split would exceed this many graph nodes")
+                   help="dag and tree: stop growing when a split would exceed this many graph nodes")
     p.add_argument("--preset", choices=sorted(PRESETS), default="explainable",
                    help="dag only: growth defaults. explainable = unsupervised k-way cluster "
                         "splits; pure = supervised k-way class splits. --max-k and "
@@ -337,6 +379,10 @@ def parse_args(argv=None):
                    help="dag only: when a split group links to an existing leaf instead of "
                         "a fresh one. loss = the leaf's loss on the group's validation "
                         "images is below half the split leaf's. Default from --preset")
+    p.add_argument("--route-acc-min", type=float, default=0.93,
+                   help="tree only: split at the earliest block whose probe head routes the "
+                        "confusion groups with at least this validation accuracy (else the "
+                        "last block)")
     p.add_argument("--growth-batches", type=int, default=50,
                    help="training batches used to measure per-leaf loss and to cluster "
                         "the chosen leaf's images before a split (and validation batches "

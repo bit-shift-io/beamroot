@@ -30,7 +30,8 @@ def module_macs(module: nn.Module, *inputs: torch.Tensor) -> int:
 
 
 def model_costs(model) -> tuple[int, dict[str, int]]:
-    """(shared stem MACs, {node: MACs}). Cascade models have no shared stem (0)."""
+    """(shared stem MACs, {node: MACs}). Cascade and tree models have no shared stem (0);
+    a tree node's MACs are its segment plus its head."""
     cfg = getattr(model, "config", None) or {}
     chans = cfg.get("in_channels", getattr(model, "in_channels", 1))
     size = cfg.get("image_size", getattr(model, "image_size", 28))
@@ -38,6 +39,12 @@ def model_costs(model) -> tuple[int, dict[str, int]]:
     img = torch.zeros(1, chans, size, size, device=device)
     stem = getattr(model, "stem", None)
     stem_macs = module_macs(stem, img) if stem is not None else 0
+    if hasattr(model, "node_cache"):  # tree: each node reads its parent's segment output
+        cache = model.node_cache(img)
+        with torch.no_grad():
+            inputs = {name: cache.input(name) for name in model.nodes}
+        return stem_macs, {name: module_macs(node, inputs[name])
+                           for name, node in model.nodes.items()}
     with torch.no_grad():
         feats = model.features(img)
     return stem_macs, {name: module_macs(node, feats) for name, node in model.nodes.items()}

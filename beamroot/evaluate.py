@@ -19,6 +19,9 @@ from beamroot.data import get_loaders
 from beamroot.device import select_device
 from beamroot.models.cascade import CascadeModel
 from beamroot.models.dag import DAGRouterModel
+from beamroot.models.tree import TreeModel
+
+KINDS = {"cascade": CascadeModel, "tree": TreeModel}
 
 
 def load_run(run_dir, device):
@@ -26,7 +29,7 @@ def load_run(run_dir, device):
     run_dir = Path(run_dir)
     config = json.loads((run_dir / "config.json").read_text())
     ckpt = torch.load(run_dir / "model.pt", map_location="cpu")
-    cls = CascadeModel if ckpt.get("kind") == "cascade" else DAGRouterModel
+    cls = KINDS.get(ckpt.get("kind"), DAGRouterModel)
     model = cls.from_checkpoint(ckpt).to(device).eval()
     return model, config
 

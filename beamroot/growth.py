@@ -2,12 +2,16 @@
 import copy
 import json
 import math
+from contextlib import contextmanager
 from itertools import islice
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
+from torch import nn
 
 from beamroot.losses import leaf_path_terms
+from beamroot.models.tree import BLOCKS, RouterHead, TreeModel, TreeNode
 
 
 def leaf_losses(model, loader, device, limit_batches=None) -> dict[str, float]:
@@ -65,6 +69,206 @@ def split_leaf(model, name: str, noise: float = 1e-3) -> tuple[str, str]:
                 p.add_(torch.randn_like(p) * noise)
         model.nodes[n] = leaf
     return new
+
+
+def tree_split(model, leaf: str, groups: list[list[int]], block: str) -> tuple[str, ...]:
+    """Split leaf `leaf` of a `TreeModel` at split block `block` (a `tree.BLOCKS` name),
+    in place. Returns the new leaves' names, in the order of `groups`.
+
+    The leaf's segment up to and including `block` stays with it, now a router whose fresh
+    `RouterHead` reads that block's output and routes to `groups` (which must partition
+    the leaf's classes). Each child leaf is an exact copy of the remaining blocks and the
+    classifier at full width, so every image's leaf output is unchanged.
+    """
+    if model.graph.nodes[leaf].kind != "leaf":
+        raise ValueError(f"only leaves can be split, {leaf!r} is a router")
+    start = model.start_block(leaf)
+    if block not in BLOCKS or BLOCKS.index(block) < start:
+        raise ValueError(f"block {block!r} is not in leaf {leaf!r}'s segment")
+    if sorted(c for g in groups for c in g) != sorted(model.node_classes(leaf)) \
+            or any(not g for g in groups):
+        raise ValueError(f"groups {groups} do not partition leaf {leaf!r}'s classes")
+    old = model.nodes[leaf]
+    ref = next(old.parameters())
+    cut = BLOCKS.index(block) + 1 - start  # blocks of the old segment the router keeps
+    new = model.graph.split(leaf, len(groups))
+    model.split_blocks[leaf] = block
+    model.groups[leaf] = [list(g) for g in groups]
+    router = model.build_node(leaf).to(ref.device)
+    blocks = list(old.segment)  # fresh Sequentials renumber keys, matching `build_node`
+    router.segment = nn.Sequential(*blocks[:cut])
+    model.nodes[leaf] = router
+    for n in new:
+        model.nodes[n] = TreeNode(copy.deepcopy(nn.Sequential(*blocks[cut:])),
+                                  copy.deepcopy(old.head))
+    return new
+
+
+def confusion_groups(confusion: torch.Tensor, classes: list[int]) -> list[list[int]]:
+    """Confusion groups (CONTEXT.md) of a leaf: the top cut of average-linkage clustering
+    on 1 - the symmetric confusion rate (experiment 0007's `hierarchy()`).
+
+    `confusion[i, j]` counts validation images of class `classes[i]` the leaf predicted as
+    `classes[j]`. Returns two groups of class ids, each sorted, ordered by smallest class.
+    """
+    conf = confusion.detach().float().cpu()
+    rate = conf / conf.sum(1, keepdim=True).clamp(min=1)
+    sim = (rate + rate.T) / 2
+    clusters = [[i] for i in range(len(classes))]
+    while len(clusters) > 2:
+        best = None
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                s = float(sim[clusters[i]][:, clusters[j]].mean())
+                if best is None or s > best[0]:
+                    best = (s, i, j)
+        _, i, j = best
+        clusters[i] = clusters[i] + clusters.pop(j)
+    return sorted(sorted(classes[k] for k in c) for c in clusters)
+
+
+def choose_split_block(block_val_acc: dict[str, float], route_acc_min: float
+                       ) -> tuple[str, str | None]:
+    """Split block from per-block validation route accuracy (in block order): the earliest
+    block at or above `route_acc_min`, else the last block with fallback "last_block".
+    Returns (block, fallback or None)."""
+    for block, acc in block_val_acc.items():
+        if acc >= route_acc_min:
+            return block, None
+    return list(block_val_acc)[-1], "last_block"
+
+
+PROBE_EPOCHS = 8  # probe head epochs over the frozen growth-batch features
+PROBE_BATCH = 128  # probe minibatch; also bounds memory on MPS
+PROBE_LR = 1e-3
+
+
+@contextmanager
+def _rng_untouched(loaders):
+    """Restore the global RNG (CPU and MPS) and the loaders' shuffle generators on exit, so
+    a growth step draws nothing from the training RNG (data augmentation, init, shuffles)."""
+    cpu = torch.get_rng_state()
+    mps = torch.mps.get_rng_state() if torch.backends.mps.is_available() else None
+    gens = [(g, g.get_state()) for g in (getattr(ld, "generator", None) for ld in loaders)
+            if g is not None]
+    try:
+        yield
+    finally:
+        torch.set_rng_state(cpu)
+        if mps is not None:
+            torch.mps.set_rng_state(mps)
+        for g, state in gens:
+            g.set_state(state)
+
+
+def _true_path_input(model, leaf: str, x: torch.Tensor, y: torch.Tensor):
+    """`leaf`'s input for the images of batch `x` whose true path reaches it, and their
+    labels: each router on the path keeps only the rows of the child's group."""
+    path = [leaf]
+    while model.graph.parents(path[-1]):
+        path.append(model.graph.parents(path[-1])[0])
+    path.reverse()
+    for node, child in zip(path, path[1:]):
+        keep = torch.zeros(model.num_classes, dtype=torch.bool, device=y.device)
+        keep[model.groups[node][model.graph.children(node).index(child)]] = True
+        rows = keep[y]
+        x, y = model.nodes[node].segment(x[rows]), y[rows]
+    return x, y
+
+
+def _leaf_block_feats(model, leaf, probes, loader, device, limit_batches):
+    """Pooled outputs of each block of `leaf`'s segment (each probe's pool), the leaf's
+    logits and the labels, over the images of `loader` whose true path reaches `leaf`."""
+    feats = {b: [] for b in probes}
+    logits, labels = [], []
+    for x, y in islice(loader, limit_batches):
+        h, y = _true_path_input(model, leaf, x.to(device), y.to(device))
+        node = model.nodes[leaf]
+        for block, layer in zip(probes, node.segment):
+            h = layer(h)
+            feats[block].append(probes[block].pool(h))
+        logits.append(node.head(h))
+        labels.append(y)
+    return ({b: torch.cat(f) for b, f in feats.items()}, torch.cat(logits), torch.cat(labels))
+
+
+def _fit_probe(head, feats, labels, gen: torch.Generator) -> None:
+    """Train `head` (on pooled features) to the group labels with its own Adam and
+    minibatch order from `gen`."""
+    opt = torch.optim.Adam(head.net.parameters(), lr=PROBE_LR)
+    for _ in range(PROBE_EPOCHS):
+        order = torch.randperm(len(feats), generator=gen).to(feats.device)
+        for s in range(0, len(feats), PROBE_BATCH):
+            idx = order[s:s + PROBE_BATCH]
+            opt.zero_grad()
+            F.cross_entropy(head.net(feats[idx]), labels[idx]).backward()
+            opt.step()
+
+
+def _probe_acc(head, feats, labels) -> float:
+    with torch.no_grad():
+        hits = sum((head.net(feats[s:s + 512]).argmax(1) == labels[s:s + 512]).sum().item()
+                   for s in range(0, len(feats), 512))
+    return hits / max(len(labels), 1)
+
+
+def _group_labels(groups, y, num_classes):
+    lookup = torch.zeros(num_classes, dtype=torch.long, device=y.device)
+    for i, g in enumerate(groups):
+        lookup[g] = i
+    return lookup[y]
+
+
+def _grow_tree(model, loader, device, epoch, run_dir, max_nodes, limit_batches, val_loader,
+               route_acc_min):
+    """`grow` for a `TreeModel` (CONTEXT.md: Confusion groups, Split block, Route accuracy)."""
+    if len(model.graph.nodes) + 2 > max_nodes:
+        return None
+    with _rng_untouched([loader, val_loader]):
+        was_training = model.training
+        model.eval()
+        losses = leaf_losses(model, loader, device, limit_batches)
+        eligible = {n: v for n, v in losses.items() if len(model.node_classes(n)) >= 2
+                    and model.start_block(n) < len(BLOCKS)}
+        if not eligible:
+            model.train(was_training)
+            return None
+        target = choose_leaf(eligible)
+        classes = model.node_classes(target)
+        torch.manual_seed(0)  # probe init; the caller's RNG state is restored on exit
+        cfg = model.config
+        probes = {BLOCKS[b]: RouterHead(cfg["width"] * 2 ** b, cfg["image_size"] // 2 ** (b + 1),
+                                        2).to(device)
+                  for b in range(model.start_block(target), len(BLOCKS))}
+        with torch.no_grad():
+            val_feats, val_logits, val_y = _leaf_block_feats(model, target, probes, val_loader,
+                                                             device, limit_batches)
+            tr_feats, _, tr_y = _leaf_block_feats(model, target, probes, loader, device,
+                                                  limit_batches)
+        cls = torch.tensor(classes, device=val_y.device)
+        pos = torch.zeros(model.num_classes, dtype=torch.long, device=val_y.device)
+        pos[cls] = torch.arange(len(classes), device=val_y.device)
+        pred = val_logits[:, cls].argmax(1)
+        k = len(classes)
+        confusion = torch.bincount((pos[val_y] * k + pred).cpu(), minlength=k * k).view(k, k)
+        groups = confusion_groups(confusion, classes)
+        tr_g = _group_labels(groups, tr_y, model.num_classes)
+        val_g = _group_labels(groups, val_y, model.num_classes)
+        gen = torch.Generator().manual_seed(0)
+        block_val_acc = {}
+        for block, head in probes.items():
+            _fit_probe(head, tr_feats[block], tr_g, gen)
+            block_val_acc[block] = _probe_acc(head, val_feats[block], val_g)
+        block, fallback = choose_split_block(block_val_acc, route_acc_min)
+        new = tree_split(model, target, groups, block)
+        model.nodes[target].head.net.load_state_dict(probes[block].net.state_dict())
+        model.train(was_training)
+    event = {"epoch": epoch, "split": target, "new_nodes": list(new),
+             "num_nodes": len(model.graph.nodes), "leaf_losses": losses, "groups": groups,
+             "block": block, "block_val_acc": block_val_acc, "fallback": fallback}
+    _log_event(run_dir, event)
+    save_graph_snapshot(model, run_dir, epoch)
+    return event
 
 
 K_MARGIN = 0.05  # a larger k must beat k = 2's silhouette by this much to be picked
@@ -802,7 +1006,7 @@ def grow(model, loader, device, epoch: int, run_dir, max_nodes: int,
          limit_batches=None, noise: float = 1e-3, max_k: int = 2,
          policy: str = "cluster", link_policy: str = "none",
          val_loader=None, silhouette_min=None, purity_gain=None,
-         leaf_init: str = "fresh") -> dict | None:
+         leaf_init: str = "fresh", route_acc_min: float = 0.93) -> dict | None:
     """One growth step: cluster-split the leaf with the highest reach-weighted loss
     (ADR 0003), clustering the same batches the loss is measured on.
 
@@ -813,7 +1017,20 @@ def grow(model, loader, device, epoch: int, run_dir, max_nodes: int,
     writes a graph snapshot to <run_dir>/graphs/epoch_NNN.json, and returns the event.
     With `link_policy="loss"`, links are decided on `val_loader` (see `cluster_split`);
     `new_nodes` lists only the fresh leaves.
+
+    A `TreeModel` grows by a supervised binary split instead (only `max_nodes`,
+    `limit_batches`, `val_loader` and `route_acc_min` apply): the leaf with the highest
+    reach-weighted loss among those with at least 2 classes is split on its confusion
+    groups (from its validation confusion) at the earliest block whose probe head routes
+    them with validation accuracy >= `route_acc_min`, else at the last block (fallback
+    "last_block"). Probe heads train on frozen features of `limit_batches` training
+    batches; the new router starts from the winning probe's weights. The event adds
+    `groups`, `block`, `block_val_acc` (per candidate block) and `fallback`. The global RNG
+    and the loaders' generators are left as they were.
     """
+    if isinstance(model, TreeModel):
+        return _grow_tree(model, loader, device, epoch, run_dir, max_nodes, limit_batches,
+                          val_loader, route_acc_min)
     room = min(max_k, max_nodes - len(model.graph.nodes))
     if room < 2:
         return None
