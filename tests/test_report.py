@@ -113,3 +113,24 @@ def test_cascade_run_writes_report_and_flow_with_steps(tmp_path):
                               "--runs-dir", str(tmp_path / leaf)]))["run_dir"]
         assert (out / "report.html").exists() and (out / "graph.png").exists()
         assert " s" in (out / "flow.txt").read_text().splitlines()[0]
+
+
+def test_tree_run_report_and_flow_name_split_block_and_leaf_width(tmp_path):
+    from beamroot.analysis import class_flow, tree_notes
+    from beamroot.growth import tree_split
+    from beamroot.models.tree import TreeModel
+    model = TreeModel(num_classes=4)
+    assert tree_notes(model) == {"root": "last b4 w128"}
+    tree_split(model, "root", [[0, 1], [2, 3]], "b2")
+    notes = tree_notes(model)
+    assert notes["root"] == "split b2" and notes["leaf1"].startswith("last b4 w")
+    g = model.graph
+    mass = {n: [1.0, 1.0, 1.0, 1.0] for n in g.nodes}
+    assert "[split b2]" in class_flow(g, mass, notes=notes).splitlines()[0]
+    assert "split b2" in node_labels(g, mass, notes=notes)["root"]
+    out = run(parse_args(["--dataset", "synthetic_cifar", "--model", "tree", "--device", "cpu",
+                          "--epochs", "1", "--limit-batches", "1", "--max-nodes", "1",
+                          "--runs-dir", str(tmp_path), "--no-report"]))["run_dir"]
+    main([str(out), "--device", "cpu", "--samples", "2", "--limit-batches", "1"])
+    assert "[last b4 w128]" in (out / "flow.txt").read_text()
+    assert (out / "report.html").exists()

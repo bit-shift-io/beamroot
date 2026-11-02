@@ -798,10 +798,254 @@ def test_a_tree_run_waits_for_a_leaf_to_settle_and_skips_do_not_move_the_end(tmp
     assert config["tree_growth"] == "settle" and config["plateau_patience"] == 2
 
 
-@pytest.mark.parametrize("flags", [["--tree-growth", "settle"], ["--plateau-delta", "0.05"],
+@pytest.mark.parametrize("flags", [["--tree-growth", "settle"], ["--tree-growth", "progressive"],
+                                   ["--plateau-delta", "0.05"],
                                    ["--plateau-patience", "3"]])
 def test_settle_flags_exit_for_other_models(tmp_path, flags):
     with pytest.raises(SystemExit, match="tree"):
         run(parse_args(["--dataset", "synthetic", "--device", "cpu", "--epochs", "1",
                         "--runs-dir", str(tmp_path), *flags]))
     assert not list(tmp_path.iterdir())
+
+
+def progressive_tree(width=16):
+    from beamroot.train import build_model
+    return build_model("tree", "cifar10", width=width, tree_growth="progressive").eval()
+
+
+def test_a_progressive_root_starts_as_b1_plus_the_classifier(tmp_path):
+    tree = progressive_tree()
+    root = tree.nodes["root"]
+    assert len(root.segment) == 1 and tree.end_block("root") == 1
+    b1_and_head = nn.Sequential(*deep4_blocks(3, 16)[:1], nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+                                nn.Linear(16, 10))
+    assert model_costs(tree)[1]["root"] == module_macs(b1_and_head, torch.zeros(1, 3, 32, 32))
+    assert tree(torch.randn(2, 3, 32, 32)).shape == (2, 10)
+    assert tree.block_width("root", 0) == 16 and root.head.linear.in_features == 16
+    torch.save(tree.checkpoint(), tmp_path / "model.pt")
+    (tmp_path / "config.json").write_text(json.dumps({"dataset": "cifar10"}))
+    back, _ = load_run(tmp_path, "cpu")
+    assert back.leaf_ends == {"root": 1}
+    x = torch.randn(3, 3, 32, 32)
+    assert torch.equal(tree(x), back(x))
+
+
+def test_deepen_narrows_the_newest_block_and_adds_the_next_one_reading_the_kept_channels(tmp_path):
+    from beamroot.growth import tree_deepen
+    torch.manual_seed(0)
+    tree = progressive_tree(width=4)
+    silence(tree.nodes["root"].segment[0][0], [1, 3])  # b1's one conv: channels 1 and 3 are dead
+    x = torch.randn(5, 3, 32, 32)
+    with torch.no_grad():
+        full_b1 = tree.nodes["root"].segment[0](x)
+    old_conv = tree.nodes["root"].segment[0][0]
+    kept = torch.tensor([0, 2])
+    assert tree_deepen(tree, "root", keep=[kept]) == "b2"
+    node = tree.nodes["root"]
+    assert tree.end_block("root") == 2 and tree.leaf_ends == {"root": 2}
+    assert len(node.segment) == 2 and tree.node_widths("root") == [2, 8]
+    assert tree.channels == {"root": [2, 8]}
+    with torch.no_grad():  # the narrowed block's output is the full block's on its kept channels
+        assert torch.equal(node.segment[0](x), full_b1[:, kept])
+    assert torch.equal(node.segment[0][0].weight, old_conv.weight[kept])  # weights kept exactly
+    assert torch.equal(node.segment[0][0].bias, old_conv.bias[kept])
+    assert node.segment[1][0].in_channels == 2 and node.segment[1][0].out_channels == 8
+    assert node.head.linear.in_features == 8  # a fresh classifier on the new block's width
+    assert tree.block_width("root", 1) == 8 and tree(x).shape == (5, 10)
+    torch.save(tree.checkpoint(), tmp_path / "model.pt")
+    (tmp_path / "config.json").write_text(json.dumps({"dataset": "cifar10"}))
+    back, _ = load_run(tmp_path, "cpu")
+    assert back.leaf_ends == {"root": 2} and back.channels == {"root": [2, 8]}
+    assert torch.equal(tree.eval()(x), back(x))
+    with pytest.raises(ValueError):  # b4 is the last block
+        for _ in range(4):
+            tree_deepen(tree, "root")
+
+
+def test_a_split_inside_a_shallow_leaf_gives_children_ending_at_its_last_block(tmp_path):
+    from beamroot.growth import tree_deepen, tree_split
+    torch.manual_seed(0)
+    tree = progressive_tree(width=4)
+    tree_deepen(tree, "root")
+    tree_deepen(tree, "root")  # root owns b1..b3
+    with pytest.raises(ValueError):
+        tree_split(tree, "root", GROUPS, "b4")  # beyond the leaf's last block
+    x = torch.randn(4, 3, 32, 32)
+    with torch.no_grad():
+        before = tree.node_cache(x).output("root")
+    a, b = tree_split(tree, "root", GROUPS, "b1")
+    assert tree.leaf_ends == {a: 3, b: 3} and "root" not in tree.leaf_ends
+    assert len(tree.nodes[a].segment) == 2 and tree.start_block(a) == 1
+    with torch.no_grad():
+        assert torch.allclose(tree.node_cache(x).output(a), before, atol=1e-6)
+    c, d = tree_split(tree, a, [[0, 1], [2, 3, 4]], "b2")  # leaf a splits at its own b2
+    assert tree.leaf_ends == {b: 3, c: 3, d: 3} and len(tree.nodes[c].segment) == 1
+    (e, f) = tree_split(tree, c, [[0], [1]], "b3")  # splits at its last block: no blocks left
+    assert len(tree.nodes[e].segment) == 0 and tree.start_block(e) == 3
+    with torch.no_grad():
+        assert tree.node_cache(x).output(e).shape == (4, 10)
+    torch.save(tree.checkpoint(), tmp_path / "model.pt")
+    (tmp_path / "config.json").write_text(json.dumps({"dataset": "cifar10"}))
+    back, _ = load_run(tmp_path, "cpu")
+    assert back.leaf_ends == tree.leaf_ends and torch.equal(tree.eval()(x), back(x))
+    # a child of a split before b4 can deepen, whether it owns blocks or none
+    assert tree_deepen(tree, e) == "b4" and tree_deepen(tree, b) == "b4"
+    assert tree.end_block(e) == 4 and tree.leaf_ends == {d: 3, f: 3}
+
+
+def shallow_leaf(train, ends=1, steps=2):
+    """A width-4 progressive root trained a little, owning blocks up to index `ends`."""
+    torch.manual_seed(0)
+    tree = TreeModel(width=4, leaf_ends={"root": ends} if ends < 4 else None)
+    opt = torch.optim.Adam(tree.parameters(), lr=3e-3)
+    for _ in range(steps):
+        for x, y in train:
+            opt.zero_grad()
+            tree.teacher_forced_loss(x, y).backward()
+            opt.step()
+    return tree
+
+
+def test_a_plateaued_leaf_that_no_block_routes_deepens_and_logs_it(tmp_path):
+    from beamroot.growth import grow
+    train, val = group_data()
+    tree = shallow_leaf(train)
+    history = {}
+    torch.manual_seed(123)
+    cpu, shuffle = torch.get_rng_state(), train.generator.get_state()
+    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=5, limit_batches=6, val_loader=val,
+                 route_acc_min=1.01, plateau_patience=0, leaf_history=history, progressive=True)
+    assert torch.equal(torch.get_rng_state(), cpu)  # deepening, init included, is seeded inside
+    assert torch.equal(train.generator.get_state(), shuffle)
+    assert event["leaf"] == "root" and event["deepen"] == "b2" and "split" not in event
+    assert list(event["block_val_acc"]) == ["b1"] and event["epoch"] == 1
+    assert tree.end_block("root") == 2 and list(tree.graph.nodes) == ["root"]
+    assert event["kept_channels"] == tree.node_widths("root")[:1]  # the narrowed block b1
+    assert event["node_macs"] == model_costs(tree)[1]["root"]
+    assert "root" not in history  # the plateau history restarts after a deepen
+    logged = json.loads((tmp_path / "growth.jsonl").read_text().splitlines()[-1])
+    assert logged["deepen"] == "b2" and logged["kept_channels"] == event["kept_channels"]
+    assert tree(next(iter(val))[0]).shape == (64, 10)
+
+
+def test_deepen_keeps_the_channels_carrying_the_leafs_activation_share(tmp_path):
+    from beamroot.growth import grow
+    train, val = group_data()
+    tree = shallow_leaf(train)
+    silence(tree.nodes["root"].segment[0][0], [0, 1])  # b1's conv: two channels never fire
+    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=5, limit_batches=6, val_loader=val,
+                 route_acc_min=1.01, plateau_patience=0, progressive=True, branch_keep=0.95)
+    assert event["kept_channels"][0] <= 2
+    full = grow(shallow_leaf(train), train, "cpu", 1, tmp_path, max_nodes=5, limit_batches=6,
+                val_loader=val, route_acc_min=1.01, plateau_patience=0, progressive=True,
+                branch_keep=1.0)
+    assert full["kept_channels"] == [4]  # branch keep 1.0 keeps the block whole
+
+
+def test_a_plateaued_leaf_at_b4_that_no_block_routes_is_skipped_not_deepened(tmp_path):
+    from beamroot.growth import grow
+    train, val = group_data()
+    tree = shallow_leaf(train, ends=4)
+    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=5, limit_batches=6, val_loader=val,
+                 route_acc_min=1.01, plateau_patience=0, progressive=True)
+    assert event["skipped"] == "below_bar" and "deepen" not in event
+    assert tree.end_block("root") == 4 and tree.leaf_ends == {}
+
+
+def test_a_progressive_leaf_splits_at_the_earliest_block_that_passes(tmp_path):
+    from beamroot.growth import grow
+    train, val = group_data()
+    tree = shallow_leaf(train, ends=3)
+    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=5, limit_batches=6, val_loader=val,
+                 route_acc_min=0.0, plateau_patience=0, progressive=True)
+    assert event["split"] == "root" and event["block"] == "b1"
+    assert list(event["block_val_acc"]) == ["b1", "b2", "b3"]
+    assert event["excluded_blocks"] == ["b4"]
+    assert tree.leaf_ends == {n: 3 for n in event["new_nodes"]}
+    assert [len(tree.nodes[n].segment) for n in event["new_nodes"]] == [2, 2]  # b2, b3 copied
+
+
+def test_the_progressive_root_may_split_at_its_last_block_unless_that_is_b4(tmp_path):
+    from beamroot.growth import grow
+    train, val = group_data()
+    tree = shallow_leaf(train, ends=1)
+    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=5, limit_batches=6, val_loader=val,
+                 route_acc_min=0.0, plateau_patience=0, progressive=True)
+    assert event["block"] == "b1" and tree.leaf_ends == {n: 1 for n in event["new_nodes"]}
+    assert all(len(tree.nodes[n].segment) == 0 for n in event["new_nodes"])
+    deep_root = shallow_leaf(train, ends=4)
+    event = grow(deep_root, train, "cpu", 1, tmp_path, max_nodes=5, limit_batches=6,
+                 val_loader=val, route_acc_min=0.0, plateau_patience=0, progressive=True)
+    assert event["block"] != "b4"
+
+
+def test_a_child_with_no_blocks_deepens_at_its_plateau_and_a_leaf_at_b4_is_never_chosen(tmp_path):
+    from beamroot.growth import grow, tree_split
+    train, val = group_data()
+    tree = shallow_leaf(train, ends=2)
+    tree_split(tree, "root", GROUPS, "b2")  # both children own no blocks, last block b2
+    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=3, limit_batches=6, val_loader=val,
+                 plateau_patience=0, progressive=True)  # room for no split: deepen only
+    assert event["deepen"] == "b3" and event["kept_channels"] == []
+    assert tree.end_block(event["leaf"]) == 3
+    assert event["block_val_acc"] == {}  # nothing to probe: no block, no split possible
+    other = ({"leaf0", "leaf1"} - {event["leaf"]}).pop()
+    assert tree.start_block(other) == 2 and tree.end_block(other) == 2
+    full = shallow_leaf(train, ends=4)
+    tree_split(full, "root", GROUPS, "b4")  # children own nothing and end at b4: ineligible
+    assert grow(full, train, "cpu", 2, tmp_path, max_nodes=9, limit_batches=6, val_loader=val,
+                plateau_patience=0, progressive=True) is None
+
+
+def test_progressive_growth_deepens_a_leaf_even_when_the_node_budget_is_spent(tmp_path):
+    from beamroot.growth import grow
+    train, val = group_data()
+    tree = shallow_leaf(train, ends=1)
+    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=1, limit_batches=6, val_loader=val,
+                 plateau_patience=0, progressive=True)
+    assert event["deepen"] == "b2" and event["block_val_acc"] == {}
+    assert grow(tree, train, "cpu", 2, tmp_path, max_nodes=1, limit_batches=6, val_loader=val,
+                plateau_patience=0) is None  # settle growth with no room still does nothing
+
+
+def test_a_progressive_run_deepens_to_b4_then_skips_and_each_deepen_moves_the_end(tmp_path, capsys):
+    d = run(parse_args(["--dataset", "synthetic_cifar", "--model", "tree", "--device", "cpu",
+                        "--tree-growth", "progressive", "--epochs", "2", "--width", "4",
+                        "--limit-batches", "2", "--max-nodes", "3", "--plateau-patience", "0",
+                        "--route-acc-min", "1.01", "--post-split-epochs", "2",
+                        "--runs-dir", str(tmp_path)]))["run_dir"]
+    events = [json.loads(s) for s in (d / "growth.jsonl").read_text().splitlines()]
+    assert [(e["epoch"], e.get("deepen"), e.get("skipped")) for e in events] == [
+        (1, "b2", None), (2, "b3", None), (3, "b4", None), (4, None, "below_bar")]
+    rows = [json.loads(s) for s in (d / "metrics.jsonl").read_text().splitlines()]
+    assert rows[-1]["epoch"] == rows[-1]["epochs_trained"] == 5  # the last deepen was epoch 3
+    model, _ = load_run(d, "cpu")
+    assert model.end_block("root") == 4 and model.leaf_ends == {}
+    assert "deepen root with b2 narrowed b1" in capsys.readouterr().out
+    assert json.loads((d / "config.json").read_text())["tree_growth"] == "progressive"
+
+
+def test_a_progressive_run_splits_and_the_children_grow_their_own_blocks(tmp_path):
+    d = run(parse_args(["--dataset", "synthetic_cifar", "--model", "tree", "--device", "cpu",
+                        "--tree-growth", "progressive", "--epochs", "6", "--width", "4",
+                        "--limit-batches", "2", "--max-nodes", "3", "--plateau-patience", "0",
+                        "--route-acc-min", "0.0", "--post-split-epochs", "2",
+                        "--runs-dir", str(tmp_path)]))["run_dir"]
+    events = [json.loads(s) for s in (d / "growth.jsonl").read_text().splitlines()]
+    assert [(e["epoch"], e["block"]) for e in events if "split" in e] == [(1, "b1")]
+    deepened = [e for e in events if "deepen" in e]  # no room to split: leaves only deepen
+    assert [(e["leaf"], e["deepen"]) for e in deepened] == [("leaf0", "b2"), ("leaf0", "b3"),
+                                                            ("leaf0", "b4")]
+    model, _ = load_run(d, "cpu")  # (the synthetic val set holds no image of leaf1's classes)
+    assert model.end_block("leaf0") == 4 and model.end_block("leaf1") == 1
+    rows = [json.loads(s) for s in (d / "metrics.jsonl").read_text().splitlines()]
+    assert rows[-1]["epochs_trained"] == max(6, max(e["epoch"] for e in events) + 2)
+
+
+def test_a_progressive_tree_that_can_never_split_is_the_plain_network(tmp_path):
+    d = run(parse_args(["--dataset", "synthetic_cifar", "--model", "tree", "--device", "cpu",
+                        "--tree-growth", "progressive", "--epochs", "1", "--limit-batches", "1",
+                        "--max-nodes", "1", "--runs-dir", str(tmp_path)]))["run_dir"]
+    model, _ = load_run(d, "cpu")
+    assert model.leaf_ends == {} and not (d / "growth.jsonl").exists()
+    assert model_costs(model)[1] == model_costs(cifar_tree())[1]

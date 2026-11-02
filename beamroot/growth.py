@@ -12,7 +12,8 @@ from torch import nn
 
 from beamroot.cost import model_costs
 from beamroot.losses import leaf_path_terms
-from beamroot.models.tree import BLOCKS, CONVS, RouterHead, TreeModel, TreeNode
+from beamroot.models.tree import (BLOCKS, CONVS, Classifier, RouterHead, TreeModel, TreeNode,
+                                  deep4_segment, deep4_widths)
 
 
 def leaf_losses(model, loader, device, limit_batches=None) -> dict[str, float]:
@@ -72,13 +73,13 @@ def split_leaf(model, name: str, noise: float = 1e-3) -> tuple[str, str]:
     return new
 
 
-def _narrow(child: TreeNode, keep: list[torch.Tensor]) -> None:
-    """Narrow `child`'s copied segment in place to the kept output channels of each conv
-    (`keep`, one index tensor per conv in segment order). Each conv's input follows the
-    previous conv's kept channels (the first conv reads its parent's output unchanged), and
-    the classifier's input follows the last. Kept weights are copied exactly."""
-    convs = [(blk, i) for blk in child.segment for i, m in enumerate(blk)
-             if isinstance(m, nn.Conv2d)]
+def _narrow_convs(blocks, keep: list[torch.Tensor]) -> torch.Tensor | None:
+    """Narrow the convs of `blocks` (conv blocks, in order) in place to the kept output
+    channels of each conv (`keep`, one index tensor per conv). Each conv's input follows the
+    previous conv's kept channels (the first conv reads its parent's output unchanged).
+    Kept weights are copied exactly. Returns the last conv's kept channels (None if there
+    are no convs)."""
+    convs = [(blk, i) for blk in blocks for i, m in enumerate(blk) if isinstance(m, nn.Conv2d)]
     if len(keep) != len(convs):
         raise ValueError(f"keep has {len(keep)} layers, the branch has {len(convs)} convs")
     prev = None
@@ -92,6 +93,14 @@ def _narrow(child: TreeNode, keep: list[torch.Tensor]) -> None:
             new.weight.copy_(w)
             new.bias.copy_(old.bias[out])
         blk[i], prev = new, out
+    return prev
+
+
+def _narrow(child: TreeNode, keep: list[torch.Tensor]) -> None:
+    """Narrow `child`'s copied segment in place to the kept output channels of each conv
+    (`keep`, one index tensor per conv in segment order), and the classifier's input to the
+    last conv's kept channels."""
+    prev = _narrow_convs(child.segment, keep)
     if prev is not None:
         old = child.head.linear
         new = nn.utils.skip_init(nn.Linear, len(prev), old.out_features,
@@ -102,6 +111,39 @@ def _narrow(child: TreeNode, keep: list[torch.Tensor]) -> None:
         child.head.linear = new
 
 
+def tree_deepen(model, leaf: str, keep: list[torch.Tensor] | None = None) -> str:
+    """Deepen leaf `leaf` of a `TreeModel` by one block, in place (DECISIONS Q12). Returns
+    the new block's name.
+
+    The leaf's newest block is narrowed to `keep` (one tensor of kept output channel indices
+    per conv of that block; None keeps it whole; ignored if the leaf owns no blocks) with its
+    kept weights copied exactly. Then the next `deep4` block is added at full `deep4` width,
+    reading the narrowed channels, and the classifier is replaced by a fresh one on the new
+    block's width. Everything else of the leaf is untouched.
+    """
+    if model.graph.nodes[leaf].kind != "leaf":
+        raise ValueError(f"only leaves can be deepened, {leaf!r} is a router")
+    end = model.end_block(leaf)
+    if end >= len(BLOCKS):
+        raise ValueError(f"leaf {leaf!r} already ends at {BLOCKS[-1]}")
+    old = model.nodes[leaf]
+    ref = next(old.parameters())
+    blocks = list(old.segment)
+    widths = model.node_widths(leaf)
+    if blocks and keep is not None:
+        _narrow_convs(blocks[-1:], keep)
+        widths = widths[:-CONVS[end - 1]] + [len(k) for k in keep]
+    full = deep4_widths(model.config["width"])
+    new_widths = full[sum(CONVS[:end]):sum(CONVS[:end + 1])]
+    in_channels = widths[-1] if widths else model.in_width(leaf)
+    model.set_leaf_end(leaf, end + 1)
+    model.set_widths(leaf, widths + new_widths)
+    blocks += deep4_segment(in_channels, end, end + 1, new_widths)
+    head = Classifier(new_widths[-1], model.num_classes)
+    model.nodes[leaf] = TreeNode(nn.Sequential(*blocks), head).to(ref.device)
+    return BLOCKS[end]
+
+
 def tree_split(model, leaf: str, groups: list[list[int]], block: str,
                keep: list[list[torch.Tensor]] | None = None) -> tuple[str, ...]:
     """Split leaf `leaf` of a `TreeModel` at split block `block` (a `tree.BLOCKS` name),
@@ -109,16 +151,16 @@ def tree_split(model, leaf: str, groups: list[list[int]], block: str,
 
     The leaf's segment up to and including `block` stays with it, now a router whose fresh
     `RouterHead` reads that block's output and routes to `groups` (which must partition
-    the leaf's classes). Each child leaf is a copy of the remaining blocks and the
-    classifier. With `keep` None the copy is exact and full width, so every image's leaf
+    the leaf's classes). Each child leaf is a copy of the remaining blocks (up to the
+    leaf's last block, `TreeModel.leaf_ends`) and the classifier. With `keep` None the copy is exact and full width, so every image's leaf
     output is unchanged. Otherwise `keep[i]` narrows child i (CONTEXT.md: Branch keep): one
     tensor of kept output channel indices per conv of the child's segment, in order (empty
     if the child owns no blocks).
     """
     if model.graph.nodes[leaf].kind != "leaf":
         raise ValueError(f"only leaves can be split, {leaf!r} is a router")
-    start = model.start_block(leaf)
-    if block not in BLOCKS or BLOCKS.index(block) < start:
+    start, end = model.start_block(leaf), model.end_block(leaf)
+    if block not in BLOCKS or not start <= BLOCKS.index(block) < end:
         raise ValueError(f"block {block!r} is not in leaf {leaf!r}'s segment")
     if sorted(c for g in groups for c in g) != sorted(model.node_classes(leaf)) \
             or any(not g for g in groups):
@@ -131,8 +173,10 @@ def tree_split(model, leaf: str, groups: list[list[int]], block: str,
     new = model.graph.split(leaf, len(groups))
     model.split_blocks[leaf] = block
     model.groups[leaf] = [list(g) for g in groups]
+    model.leaf_ends.pop(leaf, None)  # a router's end is its split block
     model.set_widths(leaf, widths[:n_convs])
     for i, n in enumerate(new):
+        model.set_leaf_end(n, end)
         model.set_widths(n, widths[n_convs:] if keep is None else [len(k) for k in keep[i]])
     router = model.build_node(leaf).to(ref.device)
     blocks = list(old.segment)  # fresh Sequentials renumber keys, matching `build_node`
@@ -198,9 +242,10 @@ def choose_split_block(block_val_acc: dict[str, float], route_acc_min: float) ->
 
 def choose_root_block(block_val_acc: dict[str, float], route_acc_min: float) -> str | None:
     """Split block for the root (DECISIONS Q5): the earliest block at or above
-    `route_acc_min`, excluding the last block, whose children would own no blocks. None
+    `route_acc_min`, excluding b4, whose children would own no blocks. None
     means no block qualifies: skip, and probe again at a later plateau (Q11)."""
-    return choose_split_block(dict(list(block_val_acc.items())[:-1]), route_acc_min)
+    return choose_split_block({b: a for b, a in block_val_acc.items() if b != BLOCKS[-1]},
+                              route_acc_min)
 
 
 def plateaued(history: list[float], delta: float, patience: int) -> bool:
@@ -353,19 +398,23 @@ def _group_labels(groups, y, num_classes):
 
 def _grow_tree(model, loader, device, epoch, run_dir, max_nodes, limit_batches, val_loader,
                route_acc_min, branch_keep, probe_batches, leaf_history, plateau_delta,
-               plateau_patience):
+               plateau_patience, progressive=False):
     """`grow` for a `TreeModel` (CONTEXT.md: Confusion groups, Split block, Route accuracy).
     Leaf losses use `limit_batches` training batches; probes and activation mass use
     `probe_batches` (None = all); confusion, route accuracy and the settle rule's leaf
-    losses use the whole `val_loader` (DECISIONS Q8, Q11)."""
-    if len(model.graph.nodes) + 2 > max_nodes:
+    losses use the whole `val_loader` (DECISIONS Q8, Q11). With `progressive`, a plateaued
+    leaf no block of which routes well deepens instead of skipping, and a spent node budget
+    still lets leaves deepen (DECISIONS Q12)."""
+    can_split = len(model.graph.nodes) + 2 <= max_nodes
+    if not can_split and not progressive:
         return None
     with _rng_untouched([loader, val_loader]):
         was_training = model.training
         model.eval()
         losses = leaf_losses(model, loader, device, limit_batches)
         eligible = {n: v for n, v in losses.items() if len(model.node_classes(n)) >= 2
-                    and model.start_block(n) < len(BLOCKS)}
+                    and model.start_block(n) < len(BLOCKS)
+                    and (can_split or model.end_block(n) < len(BLOCKS))}
         if not eligible:
             model.train(was_training)
             return None
@@ -381,37 +430,44 @@ def _grow_tree(model, loader, device, epoch, run_dir, max_nodes, limit_batches, 
         target = ready[0]
         plateau_losses = leaf_history[target][-plateau_patience - 1:]
         classes = model.node_classes(target)
-        torch.manual_seed(0)  # probe init; the caller's RNG state is restored on exit
+        torch.manual_seed(0)  # probe and deepen init; the caller's RNG state is restored on exit
         cfg = model.config
-        start = model.start_block(target)
+        start, end = model.start_block(target), model.end_block(target)
         probes = {BLOCKS[b]: RouterHead(model.block_width(target, b),
                                         cfg["image_size"] // 2 ** (b + 1), 2).to(device)
-                  for b in range(start, len(BLOCKS))}
-        with torch.no_grad():
-            val_feats, val_logits, val_y = _leaf_block_feats(model, target, probes, val_loader,
-                                                             device, None)
-        cls = torch.tensor(classes, device=val_y.device)
-        pos = torch.zeros(model.num_classes, dtype=torch.long, device=val_y.device)
-        pos[cls] = torch.arange(len(classes), device=val_y.device)
-        pred = val_logits[:, cls].argmax(1)
-        k = len(classes)
-        confusion = torch.bincount((pos[val_y] * k + pred).cpu(), minlength=k * k).view(k, k)
-        groups = confusion_groups(confusion, classes)
-        with torch.no_grad():  # the probes' batches also measure each group's activation mass
-            tr_feats, _, tr_y, mass = _leaf_block_feats(model, target, probes, loader, device,
-                                                        probe_batches, groups)
-        tr_g = _group_labels(groups, tr_y, model.num_classes)
-        val_g = _group_labels(groups, val_y, model.num_classes)
-        gen = torch.Generator().manual_seed(0)
-        block_val_acc = {}
-        for block, head in probes.items():
-            _fit_probe(head, tr_feats[block], tr_g, gen)
-            block_val_acc[block] = _probe_acc(head, val_feats[block], val_g)
+                  for b in range(start, end)}
+        groups, block_val_acc, block, mass, tr_y = None, {}, None, None, []
+        if probes and can_split:
+            with torch.no_grad():
+                val_feats, val_logits, val_y = _leaf_block_feats(model, target, probes,
+                                                                 val_loader, device, None)
+            cls = torch.tensor(classes, device=val_y.device)
+            pos = torch.zeros(model.num_classes, dtype=torch.long, device=val_y.device)
+            pos[cls] = torch.arange(len(classes), device=val_y.device)
+            pred = val_logits[:, cls].argmax(1)
+            k = len(classes)
+            confusion = torch.bincount((pos[val_y] * k + pred).cpu(),
+                                       minlength=k * k).view(k, k)
+            groups = confusion_groups(confusion, classes)
+            with torch.no_grad():  # the probes' batches also measure each group's activation mass
+                tr_feats, _, tr_y, mass = _leaf_block_feats(model, target, probes, loader,
+                                                            device, probe_batches, groups)
+            tr_g = _group_labels(groups, tr_y, model.num_classes)
+            val_g = _group_labels(groups, val_y, model.num_classes)
+            gen = torch.Generator().manual_seed(0)
+            for b, head in probes.items():
+                _fit_probe(head, tr_feats[b], tr_g, gen)
+                block_val_acc[b] = _probe_acc(head, val_feats[b], val_g)
+        elif probes and end < len(BLOCKS):  # no split possible: only the mass to narrow by
+            with torch.no_grad():
+                *_, mass = _leaf_block_feats(model, target, probes, loader, device,
+                                             probe_batches, [classes])
         root = target == model.graph.root
-        block = (choose_root_block if root else choose_split_block)(block_val_acc,
-                                                                    route_acc_min)
-        skip = block is None
-        if not skip:
+        if block_val_acc:
+            block = (choose_root_block if root else choose_split_block)(block_val_acc,
+                                                                        route_acc_min)
+        deepen = block is None and progressive and end < len(BLOCKS)
+        if block is not None:
             n_convs = sum(CONVS[start:BLOCKS.index(block) + 1])  # convs the router keeps
             keep = None if branch_keep >= 1.0 else [
                 [keep_channels(m, branch_keep) for m in per_conv[n_convs:]] for per_conv in mass]
@@ -419,8 +475,27 @@ def _grow_tree(model, loader, device, epoch, run_dir, max_nodes, limit_batches, 
             model.nodes[target].head.net.load_state_dict(probes[block].net.state_dict())
             node_macs = model_costs(model)[1]
             leaf_history.pop(target)  # now a router; its new leaves start with no history
+        elif deepen:
+            keep = None
+            if probes:  # narrow the newest block by the mass of all the leaf's own images
+                first = sum(CONVS[start:end - 1])
+                keep = [keep_channels(sum(per_conv[j] for per_conv in mass), branch_keep)
+                        for j in range(first, first + CONVS[end - 1])]
+            kept = [len(k) for k in keep] if keep else []
+            new_block = tree_deepen(model, target, keep)
+            node_macs = model_costs(model)[1][target]
+            leaf_history.pop(target)  # the new classifier starts the plateau history afresh
         model.train(was_training)
-    if skip:  # a leaf only splits at a block that routes well; retry at a later plateau
+    if deepen:
+        event = {"epoch": epoch, "leaf": target, "deepen": new_block,
+                 "narrowed_block": BLOCKS[end - 1] if probes else None,
+                 "kept_channels": kept,
+                 "num_nodes": len(model.graph.nodes), "leaf_losses": losses,
+                 "plateau_losses": plateau_losses, "block_val_acc": block_val_acc,
+                 "branch_keep": branch_keep, "node_macs": node_macs}
+        _log_event(run_dir, event)
+        return event
+    if block is None:  # a leaf only splits at a block that routes well; retry at a later plateau
         event = {"epoch": epoch, "leaf": target, "skipped": "below_bar",
                  "num_nodes": len(model.graph.nodes), "leaf_losses": losses,
                  "plateau_losses": plateau_losses, "groups": groups,
@@ -1181,7 +1256,7 @@ def grow(model, loader, device, epoch: int, run_dir, max_nodes: int,
          leaf_init: str = "fresh", route_acc_min: float = 0.93,
          branch_keep: float = 0.95, probe_batches: int | None = None,
          leaf_history: dict[str, list[float]] | None = None, plateau_delta: float = 0.03,
-         plateau_patience: int = 2) -> dict | None:
+         plateau_patience: int = 2, progressive: bool = False) -> dict | None:
     """One growth step: cluster-split the leaf with the highest reach-weighted loss
     (ADR 0003), clustering the same batches the loss is measured on.
 
@@ -1226,7 +1301,7 @@ def grow(model, loader, device, epoch: int, run_dir, max_nodes: int,
         return _grow_tree(model, loader, device, epoch, run_dir, max_nodes, limit_batches,
                           val_loader, route_acc_min, branch_keep, probe_batches,
                           {} if leaf_history is None else leaf_history, plateau_delta,
-                          plateau_patience)
+                          plateau_patience, progressive)
     room = min(max_k, max_nodes - len(model.graph.nodes))
     if room < 2:
         return None

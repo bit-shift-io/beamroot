@@ -93,7 +93,7 @@ def train_epoch(model, loader, opt, device, limit_batches=None, balance_weight=0
 
 def build_model(name: str, dataset: str = "mnist", width: int | None = None,
                 hidden: int | None = None, size_axis: str = "both", start_step: int = 4,
-                leaf: str = "classifier"):
+                leaf: str = "classifier", tree_growth: str | None = None):
     info = dataset_info(dataset)
     width = width or (TREE_WIDTH if name == "tree" else info["width"])
     dims = {"in_channels": info["channels"], "image_size": info["image_size"],
@@ -105,7 +105,8 @@ def build_model(name: str, dataset: str = "mnist", width: int | None = None,
     if name == "cascade":
         return CascadeModel(**dims, size_axis=size_axis, start_step=start_step, leaf=leaf)
     if name == "tree":
-        return TreeModel(**dims)
+        # progressive trees grow depth: the root starts as b1 plus the classifier (Q12)
+        return TreeModel(**dims, leaf_ends={"root": 1} if tree_growth == "progressive" else None)
     raise ValueError(f"unknown model {name!r}")
 
 
@@ -192,7 +193,9 @@ def run(args, after_epoch=None) -> dict:
             raise SystemExit("--match-params only applies to --model baseline")
         args.width, args.hidden = matched_size(args.match_params, args.dataset)
     model = build_model(args.model, args.dataset, args.width, args.hidden,
-                        args.size_axis, args.start_step, args.leaf).to(device)
+                        args.size_axis, args.start_step, args.leaf,
+                        # a tree that can never split (--max-nodes < 3) is the plain network
+                        args.tree_growth if args.max_nodes >= 3 else None).to(device)
     if args.model == "cascade":
         model.prune_reach = args.prune_reach
     if args.model == "cascade":  # one group per node, so ancestor routers can decay alone
@@ -283,7 +286,8 @@ def run(args, after_epoch=None) -> dict:
                          leaf_init=args.leaf_init, route_acc_min=args.route_acc_min,
                          branch_keep=args.branch_keep, probe_batches=args.probe_batches,
                          leaf_history=leaf_history, plateau_delta=args.plateau_delta,
-                         plateau_patience=args.plateau_patience)
+                         plateau_patience=args.plateau_patience,
+                         progressive=args.tree_growth == "progressive")
             if event and "waiting" in event:  # no tree leaf has settled: nothing changed
                 losses = ", ".join(f"{n} {v:.4f}" for n, v in event["val_losses"].items())
                 print(f"  waiting: {', '.join(event['waiting'])} (val loss {losses})",
@@ -295,10 +299,19 @@ def run(args, after_epoch=None) -> dict:
                       f"groups {event['groups']} route acc {accs} plateau losses "
                       f"{[round(v, 4) for v in event['plateau_losses']]}", flush=True)
                 event = None
-            fresh = event["new_nodes"] if event else []  # fresh leaves only, not linked ones
+            fresh = event.get("new_nodes", []) if event else []  # fresh leaves only, not linked
             if event or merges or any('to' in b for b in bumps):
                 opt = rebuild_optimizer(model, opt, lr=args.lr)
-            if event and isinstance(model, TreeModel):
+            if event and "deepen" in event:  # a progressive leaf gained a block
+                end = max(end, epoch + args.post_split_epochs)
+                accs = {b: round(a, 3) for b, a in event["block_val_acc"].items()}
+                narrowed = (f"narrowed {event['narrowed_block']} to {event['kept_channels']} "
+                            if event["narrowed_block"] else "")
+                print(f"  deepen {event['leaf']} with {event['deepen']} {narrowed}"
+                      f"route acc {accs} plateau losses "
+                      f"{[round(v, 4) for v in event['plateau_losses']]} "
+                      f"(MACs {event['node_macs'] / 1e6:.2f}M)", flush=True)
+            elif event and isinstance(model, TreeModel):
                 end = max(end, epoch + args.post_split_epochs)
                 accs = {b: round(a, 3) for b, a in event["block_val_acc"].items()}
                 print(f"  split {event['split']} -> {event['new_nodes']} at {event['block']} "
@@ -423,9 +436,11 @@ def parse_args(argv=None):
                    help="tree only: split at the earliest block whose probe head routes the "
                         "confusion groups with at least this validation accuracy (else skip "
                         "and probe again at a later plateau)")
-    p.add_argument("--tree-growth", choices=["settle"], default=None,
+    p.add_argument("--tree-growth", choices=["settle", "progressive"], default=None,
                    help="tree only: how a tree grows. settle = a leaf acts once its "
-                        "validation loss has plateaued (default)")
+                        "validation loss has plateaued (default); progressive = the same "
+                        "rule, but the root starts as b1 and a plateaued leaf that no block "
+                        "routes well gains the next block instead of skipping")
     p.add_argument("--plateau-delta", type=float, default=0.03,
                    help="tree only: a leaf has plateaued when its true-path validation loss "
                         "improved by less than this share over the last --plateau-patience "

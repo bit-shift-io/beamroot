@@ -138,6 +138,10 @@ class TreeModel(nn.Module):
     segment starts after its parent's split block and ends at its own split block (router)
     or the last block (leaf). Built by `growth.tree_split`.
 
+    Leaf depth: `leaf_ends[leaf]` is the index in `BLOCKS` one past the leaf's last block, kept
+    only where it is not `len(BLOCKS)` (a leaf normally owns every block up to b4; a
+    progressive tree's leaves grow one block at a time, `growth.tree_deepen`).
+
     Branch widths: `channels[node]` lists the output channels of each conv of the node's
     segment, for nodes narrowed by branch keep; other nodes have `deep4`'s widths
     (`node_widths`). A node's segment reads its parent's last conv width.
@@ -149,7 +153,8 @@ class TreeModel(nn.Module):
                  image_size: int = 32, num_classes: int = 10, width: int = 16,
                  split_blocks: dict[str, str] | None = None,
                  groups: dict[str, list[list[int]]] | None = None,
-                 channels: dict[str, list[int]] | None = None):
+                 channels: dict[str, list[int]] | None = None,
+                 leaf_ends: dict[str, int] | None = None):
         super().__init__()
         self.config = {"in_channels": in_channels, "image_size": image_size,
                        "num_classes": num_classes, "width": width}
@@ -161,6 +166,7 @@ class TreeModel(nn.Module):
         self.split_blocks = dict(split_blocks or {})
         self.groups = {r: [list(g) for g in gs] for r, gs in (groups or {}).items()}
         self.channels = {n: list(w) for n, w in (channels or {}).items()}
+        self.leaf_ends = dict(leaf_ends or {})
         self.nodes = nn.ModuleDict()
         for name in self.graph.topological_order():
             self.nodes[name] = self.build_node(name)
@@ -180,8 +186,15 @@ class TreeModel(nn.Module):
     def end_block(self, name: str) -> int:
         """Index in `BLOCKS` one past the last block node `name`'s segment owns."""
         if self.graph.nodes[name].kind == "leaf":
-            return len(BLOCKS)
+            return self.leaf_ends.get(name, len(BLOCKS))
         return BLOCKS.index(self.split_blocks[name]) + 1
+
+    def set_leaf_end(self, name: str, end: int) -> None:
+        """Record leaf `name`'s end block index (kept only where it is not `len(BLOCKS)`)."""
+        if end == len(BLOCKS):
+            self.leaf_ends.pop(name, None)
+        else:
+            self.leaf_ends[name] = end
 
     def default_widths(self, name: str) -> list[int]:
         """`deep4`'s conv widths over node `name`'s segment."""
@@ -293,12 +306,13 @@ class TreeModel(nn.Module):
     def checkpoint(self) -> dict:
         return {"kind": "tree", "config": self.config, "graph": self.graph.to_dict(),
                 "split_blocks": dict(self.split_blocks), "groups": self.groups,
-                "channels": dict(self.channels), "state_dict": self.state_dict()}
+                "channels": dict(self.channels), "leaf_ends": dict(self.leaf_ends),
+                "state_dict": self.state_dict()}
 
     @classmethod
     def from_checkpoint(cls, ckpt: dict) -> "TreeModel":
         model = cls(graph=RouterGraph.from_dict(ckpt["graph"]), **ckpt["config"],
                     split_blocks=ckpt.get("split_blocks"), groups=ckpt.get("groups"),
-                    channels=ckpt.get("channels"))
+                    channels=ckpt.get("channels"), leaf_ends=ckpt.get("leaf_ends"))
         model.load_state_dict(ckpt["state_dict"])
         return model

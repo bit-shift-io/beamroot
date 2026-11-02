@@ -70,7 +70,25 @@ def collect_stats(model, loader, device, num_classes, limit_batches=None) -> dic
             "entropy": {r: e / count for r, e in ent_sum.items()}}
 
 
-def class_flow(graph, class_mass, class_names=None, steps=None) -> str:
+def tree_notes(model) -> dict[str, str]:
+    """Tree node -> short note: a router's split block, a leaf's last block and its width
+    (a progressive tree's leaves differ in depth). {} for models that are not trees."""
+    from beamroot.models.tree import BLOCKS
+    if not hasattr(model, "split_blocks"):
+        return {}
+    notes = {}
+    for n in model.graph.nodes:
+        if model.graph.nodes[n].kind == "router":
+            notes[n] = f"split {model.split_blocks[n]}"
+        elif model.end_block(n) > model.start_block(n):
+            last = model.end_block(n) - 1
+            notes[n] = f"last {BLOCKS[last]} w{model.block_width(n, last)}"
+        else:
+            notes[n] = "no blocks"
+    return notes
+
+
+def class_flow(graph, class_mass, class_names=None, steps=None, notes=None) -> str:
     """Text tree of which classes reach each node, with reach (node mass / root mass).
 
     Routers list classes with >= 10% of that class's root mass reaching them; leaves list
@@ -89,6 +107,7 @@ def class_flow(graph, class_mass, class_names=None, steps=None) -> str:
         reach = total / root_total if root_total > 0 else 0.0
         head = f"{n}  reach {reach * 100:.0f}%"
         tail = f"  s{steps[n]}" if steps else ""
+        tail += f"  [{notes[n]}]" if notes else ""
         if n == root:
             return f"{head}  {{all classes}}{tail}"
         if graph.nodes[n].kind == "router":

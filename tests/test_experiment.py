@@ -308,3 +308,35 @@ def test_cascadecifar_grid_reuses_mnist_variants_on_cifar10():
                                                "--start-step", "4"]}
     flags = grid["variants"]["both-classifier-copy-settle-start4"]
     assert experiment.train.parse_args(["--dataset", "cifar10", *flags]).start_step == 4
+
+
+def test_treecifar_grid_runs_end_to_end_with_tree_columns(tmp_path):
+    grid = experiment.GRIDS["treecifar"]
+    assert set(grid["variants"]) == {"tree", "tree-progressive", "tree-keep1", "tree-plain",
+                                     "tree-plain-progressive", "dag"}
+    exp = experiment.main(["treecifar", "--datasets", "synthetic_cifar", "--epochs", "2",
+                           "--device", "cpu", "--limit-batches", "2", "--runs-dir", str(tmp_path)])
+    runs = {r["variant"]: r for r in json.loads((exp / "summary.json").read_text())["runs"]}
+    assert runs["tree-plain"]["epochs_trained"] == 2
+    assert runs["tree"]["beam1_macs"] and runs["tree-plain"]["mean_split_block"] is None
+    assert runs["dag"]["epochs_trained"] is None
+    assert "epochs trained" in (exp / "summary.md").read_text()
+
+
+def test_plain_variant_trains_as_many_epochs_as_its_tree_run(tmp_path, monkeypatch):
+    seen = {}
+    real = experiment.train.run
+
+    def spy(args):
+        seen[args.name] = args.epochs
+        return real(args)
+    monkeypatch.setattr(experiment.train, "run", spy)
+    monkeypatch.setitem(experiment.GRIDS["treecifar"], "variants", {
+        k: v for k, v in experiment.GRIDS["treecifar"]["variants"].items()
+        if k in ("tree", "tree-plain")})
+    monkeypatch.setitem(experiment.GRIDS["treecifar"], "epochs", {"synthetic_cifar": 3})
+    experiment.main(["treecifar", "--datasets", "synthetic_cifar", "--device", "cpu",
+                     "--limit-batches", "2", "--runs-dir", str(tmp_path)])
+    trained = json.loads((tmp_path / "treecifar" / "summary.json").read_text())["runs"][0]
+    assert seen["synthetic_cifar-seed0-tree-plain"] >= 3
+    assert seen["synthetic_cifar-seed0-tree-plain"] == trained["epochs_trained"]

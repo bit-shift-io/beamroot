@@ -98,15 +98,30 @@ GRIDS["cascadecifar"] = {
         # Start every node at the largest size: do big cascade routers become decisive?
         # The later --start-step wins in argparse.
         "both-classifier-copy-settle-start4": [*_COPY_SETTLE, "--start-step", "4"]}}
+# Experiment 0008: the trunk tree against its plain base network and the dag. A plain run
+# trains for as many epochs as the tree run named in "epochs_from" (growth moves a tree's end).
+GRIDS["treecifar"] = {
+    "datasets": ["cifar10"], "seeds": [0], "epochs": {"cifar10": 15},
+    "epochs_from": {"tree-plain": "tree", "tree-plain-progressive": "tree-progressive"},
+    "variants": {
+        "tree": ["--model", "tree", "--max-nodes", "7"],
+        "tree-progressive": ["--model", "tree", "--tree-growth", "progressive",
+                             "--max-nodes", "7"],
+        "tree-keep1": ["--model", "tree", "--branch-keep", "1.0"],
+        "tree-plain": ["--model", "tree", "--max-nodes", "1"],
+        "tree-plain-progressive": ["--model", "tree", "--tree-growth", "progressive",
+                                   "--max-nodes", "1"],
+        "dag": GRIDS["cascade"]["variants"]["dag"]}}
 METRICS = ["beam1_acc", "beam3_acc", "soft_acc", "gap", "leaves", "mean_k", "links",
            "beam1_nodes", "split_router_entropy", "leaf_purity", "merges",
            "closest_merge_kl", "train_minutes", "beam1_macs", "beam1_ms", "bumps", "mean_step",
-           "train_evals", "trained_evals", "frozen_routers"]
+           "train_evals", "trained_evals", "frozen_routers", "mean_split_block", "epochs_trained"]
 HEADERS = ["beam-1 acc", "beam-3 acc", "soft acc", "soft − beam-1", "leaves", "mean k",
            "links", "beam-1 nodes", "split-router entropy", "leaf purity",
            "merges", "closest merge KL", "train min", "beam-1 MACs", "beam-1 ms/image",
            "bumps", "mean node step", "train node evals/image",
-           "trained node evals/image", "frozen routers"]
+           "trained node evals/image", "frozen routers", "mean split block",
+           "epochs trained"]
 
 
 def _jsonl(path: Path) -> list[dict]:
@@ -136,6 +151,8 @@ def run_metrics(run_dir) -> dict:
     trained = [e["trained_node_evals"] for e in _jsonl(run_dir / "metrics.jsonl")
                if "trained_node_evals" in e]
     freezes = [e["freezes"] for e in _jsonl(run_dir / "metrics.jsonl") if "freezes" in e]
+    epochs = [e["epochs_trained"] for e in _jsonl(run_dir / "metrics.jsonl")
+              if "epochs_trained" in e]
     merges, kls, ks, links, bumps = 0, [], [], 0, 0
     for event in _jsonl(run_dir / "growth.jsonl"):
         # a router-check line has "bump": name; a split event's size check has "bump": {...}
@@ -173,6 +190,8 @@ def run_metrics(run_dir) -> dict:
         "train_evals": _mean_or_none(evals),
         "trained_evals": _mean_or_none(trained),
         "frozen_routers": freezes[-1] if freezes else None,   # count at the final epoch
+        "mean_split_block": extra.get("mean_split_block"),
+        "epochs_trained": epochs[-1] if epochs else None,
     }
 
 
@@ -190,7 +209,8 @@ def finished_run(exp_dir: Path, name: str) -> Path | None:
 def measure(run_dir: Path, device, limit_batches=None, train_minutes: float = 0.0) -> None:
     """Test-set reporting numbers for a trained run: experiment.json, then eval.json last
     (eval.json marks the run finished)."""
-    from beamroot.analysis import class_flow, collect_stats, purity
+    from beamroot.analysis import class_flow, collect_stats, purity, tree_notes
+    from beamroot.models.tree import BLOCKS
     from beamroot.data import dataset_info, get_loaders
     from beamroot.evaluate import evaluate_modes, load_run
     model, config = load_run(run_dir, device)
@@ -200,11 +220,14 @@ def measure(run_dir: Path, device, limit_batches=None, train_minutes: float = 0.
     stats = collect_stats(model, test_loader, device, model.num_classes, limit_batches)
     leaves = [n for n in model.graph.topological_order() if model.graph.nodes[n].kind == "leaf"]
     (run_dir / "flow.txt").write_text(class_flow(
-        model.graph, stats["class_mass"], dataset_info(config["dataset"]).get("classes")) + "\n")
+        model.graph, stats["class_mass"], dataset_info(config["dataset"]).get("classes"),
+        notes=tree_notes(model) or None) + "\n")
     (run_dir / "experiment.json").write_text(json.dumps({
         "train_minutes": train_minutes,
         "leaves": len(leaves),
         **({"mean_step": mean(model.steps.values())} if hasattr(model, "steps") else {}),
+        **({"mean_split_block": mean(BLOCKS.index(b) + 1 for b in model.split_blocks.values())}
+           if getattr(model, "split_blocks", None) else {}),
         "router_entropy": stats["entropy"],
         "leaf_purity": {n: purity(stats["class_mass"][n])[1] for n in leaves}}, indent=2))
     (run_dir / "eval.json").write_text(json.dumps(rows, indent=2))
@@ -239,7 +262,8 @@ def _cell(s: dict, digits: int) -> str:
 def format_table(rows: list[dict]) -> str:
     digits = {"merges": 1, "train_minutes": 1, "leaves": 1, "mean_k": 2, "links": 1,
               "beam1_nodes": 2, "beam1_macs": 0, "beam1_ms": 2, "bumps": 1,
-              "mean_step": 2, "train_evals": 2, "trained_evals": 2, "frozen_routers": 1}
+              "mean_step": 2, "train_evals": 2, "trained_evals": 2, "frozen_routers": 1,
+              "mean_split_block": 2, "epochs_trained": 0}
     with_variant = any(r.get("variant") for r in rows)
     head = ["dataset"] + (["variant"] if with_variant else []) + ["n"] + HEADERS
     lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
@@ -269,6 +293,7 @@ def parse_args(argv=None):
         if getattr(args, axis) is None:
             setattr(args, axis, grid[axis])
     args.variants = grid.get("variants", {None: []})
+    args.epochs_from = grid.get("epochs_from", {})
     args.grid_epochs = grid.get("epochs", {})
     return args
 
@@ -294,6 +319,11 @@ def main(argv=None) -> Path:
             argv += flags
             argv += [] if args.report else ["--no-report"]
             epochs = args.epochs if args.epochs is not None else args.grid_epochs.get(dataset)
+            ref = args.epochs_from.get(variant)
+            if args.epochs is None and ref:  # same epochs as the tree run it is compared to
+                ref_epochs = next((r["epochs_trained"] for r in runs if r["variant"] == ref
+                                   and r["seed"] == seed and r["dataset"] == dataset), None)
+                epochs = ref_epochs or epochs
             for flag, value in [("--device", args.device), ("--epochs", epochs),
                                 ("--limit-batches", args.limit_batches)]:
                 argv += [flag, str(value)] if value is not None else []
