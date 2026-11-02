@@ -3,7 +3,7 @@ import copy
 import json
 import math
 from contextlib import contextmanager
-from itertools import islice
+from itertools import combinations, islice
 from pathlib import Path
 
 import torch
@@ -152,11 +152,16 @@ def confusion_groups(confusion: torch.Tensor, classes: list[int]) -> list[list[i
 
     `confusion[i, j]` counts validation images of class `classes[i]` the leaf predicted as
     `classes[j]`. Returns two groups of class ids, each sorted, ordered by smallest class.
+
+    With 4 or more classes each group has at least 2 (DECISIONS Q9): if the top cut has a
+    singleton, the binary partition with both groups of at least 2 classes and the highest
+    mean between-group dissimilarity (1 - symmetric confusion rate) is taken instead.
     """
     conf = confusion.detach().float().cpu()
     rate = conf / conf.sum(1, keepdim=True).clamp(min=1)
     sim = (rate + rate.T) / 2
-    clusters = [[i] for i in range(len(classes))]
+    n = len(classes)
+    clusters = [[i] for i in range(n)]
     while len(clusters) > 2:
         best = None
         for i in range(len(clusters)):
@@ -166,28 +171,47 @@ def confusion_groups(confusion: torch.Tensor, classes: list[int]) -> list[list[i
                     best = (s, i, j)
         _, i, j = best
         clusters[i] = clusters[i] + clusters.pop(j)
+    if n >= 4 and min(len(c) for c in clusters) < 2:
+        best = None  # position 0 stays in the first group, so each partition is seen once
+        for size in range(2, n - 1):
+            for rest in combinations(range(1, n), size - 1):
+                a = [0, *rest]
+                b = [k for k in range(n) if k not in a]
+                if len(b) < 2:
+                    continue
+                d = 1 - float(sim[a][:, b].mean())
+                if best is None or d > best[0]:
+                    best = (d, [a, b])
+        clusters = best[1]
     return sorted(sorted(classes[k] for k in c) for c in clusters)
 
 
-def choose_split_block(block_val_acc: dict[str, float], route_acc_min: float
-                       ) -> tuple[str, str | None]:
-    """Split block from per-block validation route accuracy (in block order): the earliest
-    block at or above `route_acc_min`, else the last block with fallback "last_block".
-    Returns (block, fallback or None)."""
+def choose_split_block(block_val_acc: dict[str, float], route_acc_min: float) -> str | None:
+    """Split block for a non-root leaf from per-block validation route accuracy (in block
+    order): the earliest block at or above `route_acc_min`. None means no block qualifies:
+    skip, and probe again at a later plateau (DECISIONS Q11; no fallback)."""
     for block, acc in block_val_acc.items():
         if acc >= route_acc_min:
-            return block, None
-    return list(block_val_acc)[-1], "last_block"
+            return block
+    return None
 
 
 def choose_root_block(block_val_acc: dict[str, float], route_acc_min: float) -> str | None:
     """Split block for the root (DECISIONS Q5): the earliest block at or above
     `route_acc_min`, excluding the last block, whose children would own no blocks. None
-    means no block qualifies: skip this growth step and probe again at the next."""
-    for block, acc in list(block_val_acc.items())[:-1]:
-        if acc >= route_acc_min:
-            return block
-    return None
+    means no block qualifies: skip, and probe again at a later plateau (Q11)."""
+    return choose_split_block(dict(list(block_val_acc.items())[:-1]), route_acc_min)
+
+
+def plateaued(history: list[float], delta: float, patience: int) -> bool:
+    """Settle rule (DECISIONS Q11): a leaf's validation loss `history` (one value per growth
+    epoch, oldest first) has plateaued when it improved by less than `delta` (relative) over
+    the last `patience` growth epochs. Needs `patience + 1` measurements; patience 0 means a
+    leaf acts at its first measurement."""
+    if len(history) < patience + 1:
+        return False
+    before = history[-patience - 1]
+    return before - history[-1] < delta * before
 
 
 def keep_channels(mass: torch.Tensor, share: float) -> torch.Tensor:
@@ -240,6 +264,31 @@ def _true_path_input(model, leaf: str, x: torch.Tensor, y: torch.Tensor):
         rows = keep[y]
         x, y = model.nodes[node].segment(x[rows]), y[rows]
     return x, y
+
+
+def true_path_losses(model, loader, device) -> dict[str, float]:
+    """Each leaf's mean cross-entropy over the images of `loader` whose true path reaches it
+    (CONTEXT.md: Teacher forcing), in one pass. Leaves no image reaches are left out."""
+    sums, counts = {}, {}
+
+    def visit(name, h, y):
+        h = model.nodes[name].segment(h)
+        children = model.graph.children(name)
+        if not children:
+            sums[name] = sums.get(name, 0.0) + F.cross_entropy(
+                model.nodes[name].head(h), y, reduction="sum").item()
+            counts[name] = counts.get(name, 0) + len(y)
+            return
+        group_of = _group_labels(model.groups[name], y, model.num_classes)
+        for i, child in enumerate(children):
+            rows = group_of == i
+            if rows.any():
+                visit(child, h[rows], y[rows])
+
+    with torch.no_grad():
+        for x, y in loader:
+            visit(model.graph.root, x.to(device), y.to(device))
+    return {n: sums[n] / counts[n] for n in sums}
 
 
 def _leaf_block_feats(model, leaf, probes, loader, device, limit_batches, groups=None):
@@ -303,8 +352,12 @@ def _group_labels(groups, y, num_classes):
 
 
 def _grow_tree(model, loader, device, epoch, run_dir, max_nodes, limit_batches, val_loader,
-               route_acc_min, branch_keep):
-    """`grow` for a `TreeModel` (CONTEXT.md: Confusion groups, Split block, Route accuracy)."""
+               route_acc_min, branch_keep, probe_batches, leaf_history, plateau_delta,
+               plateau_patience):
+    """`grow` for a `TreeModel` (CONTEXT.md: Confusion groups, Split block, Route accuracy).
+    Leaf losses use `limit_batches` training batches; probes and activation mass use
+    `probe_batches` (None = all); confusion, route accuracy and the settle rule's leaf
+    losses use the whole `val_loader` (DECISIONS Q8, Q11)."""
     if len(model.graph.nodes) + 2 > max_nodes:
         return None
     with _rng_untouched([loader, val_loader]):
@@ -316,7 +369,17 @@ def _grow_tree(model, loader, device, epoch, run_dir, max_nodes, limit_batches, 
         if not eligible:
             model.train(was_training)
             return None
-        target = choose_leaf(eligible)
+        for leaf, loss in true_path_losses(model, val_loader, device).items():
+            leaf_history.setdefault(leaf, []).append(loss)
+        order = sorted(eligible, key=eligible.get, reverse=True)
+        ready = [n for n in order
+                 if plateaued(leaf_history.get(n, []), plateau_delta, plateau_patience)]
+        if not ready:  # nothing has settled yet: no action, nothing logged
+            model.train(was_training)
+            return {"epoch": epoch, "waiting": order,
+                    "val_losses": {n: leaf_history[n][-1] for n in order if n in leaf_history}}
+        target = ready[0]
+        plateau_losses = leaf_history[target][-plateau_patience - 1:]
         classes = model.node_classes(target)
         torch.manual_seed(0)  # probe init; the caller's RNG state is restored on exit
         cfg = model.config
@@ -326,7 +389,7 @@ def _grow_tree(model, loader, device, epoch, run_dir, max_nodes, limit_batches, 
                   for b in range(start, len(BLOCKS))}
         with torch.no_grad():
             val_feats, val_logits, val_y = _leaf_block_feats(model, target, probes, val_loader,
-                                                             device, limit_batches)
+                                                             device, None)
         cls = torch.tensor(classes, device=val_y.device)
         pos = torch.zeros(model.num_classes, dtype=torch.long, device=val_y.device)
         pos[cls] = torch.arange(len(classes), device=val_y.device)
@@ -336,7 +399,7 @@ def _grow_tree(model, loader, device, epoch, run_dir, max_nodes, limit_batches, 
         groups = confusion_groups(confusion, classes)
         with torch.no_grad():  # the probes' batches also measure each group's activation mass
             tr_feats, _, tr_y, mass = _leaf_block_feats(model, target, probes, loader, device,
-                                                        limit_batches, groups)
+                                                        probe_batches, groups)
         tr_g = _group_labels(groups, tr_y, model.num_classes)
         val_g = _group_labels(groups, val_y, model.num_classes)
         gen = torch.Generator().manual_seed(0)
@@ -345,10 +408,8 @@ def _grow_tree(model, loader, device, epoch, run_dir, max_nodes, limit_batches, 
             _fit_probe(head, tr_feats[block], tr_g, gen)
             block_val_acc[block] = _probe_acc(head, val_feats[block], val_g)
         root = target == model.graph.root
-        if root:
-            block, fallback = choose_root_block(block_val_acc, route_acc_min), None
-        else:
-            block, fallback = choose_split_block(block_val_acc, route_acc_min)
+        block = (choose_root_block if root else choose_split_block)(block_val_acc,
+                                                                    route_acc_min)
         skip = block is None
         if not skip:
             n_convs = sum(CONVS[start:BLOCKS.index(block) + 1])  # convs the router keeps
@@ -357,17 +418,22 @@ def _grow_tree(model, loader, device, epoch, run_dir, max_nodes, limit_batches, 
             new = tree_split(model, target, groups, block, keep=keep)
             model.nodes[target].head.net.load_state_dict(probes[block].net.state_dict())
             node_macs = model_costs(model)[1]
+            leaf_history.pop(target)  # now a router; its new leaves start with no history
         model.train(was_training)
-    if skip:  # the root only splits at a block that routes well; retry next growth step
-        event = {"epoch": epoch, "leaf": target, "skipped": "root_below_bar",
-                 "num_nodes": len(model.graph.nodes), "leaf_losses": losses, "groups": groups,
-                 "block_val_acc": block_val_acc, "excluded_blocks": [BLOCKS[-1]]}
+    if skip:  # a leaf only splits at a block that routes well; retry at a later plateau
+        event = {"epoch": epoch, "leaf": target, "skipped": "below_bar",
+                 "num_nodes": len(model.graph.nodes), "leaf_losses": losses,
+                 "plateau_losses": plateau_losses, "groups": groups,
+                 "block_val_acc": block_val_acc}
+        if root:
+            event["excluded_blocks"] = [BLOCKS[-1]]
         _log_event(run_dir, event)
         return event
     event = {"epoch": epoch, "split": target, "new_nodes": list(new),
-             "num_nodes": len(model.graph.nodes), "leaf_losses": losses, "groups": groups,
-             "block": block, "block_val_acc": block_val_acc, "fallback": fallback,
-             "branch_keep": branch_keep,
+             "num_nodes": len(model.graph.nodes), "leaf_losses": losses,
+             "plateau_losses": plateau_losses, "groups": groups,
+             "block": block, "block_val_acc": block_val_acc,
+             "probe_images": len(tr_y), "branch_keep": branch_keep,
              "branch_channels": {n: model.node_widths(n) for n in new},
              "branch_macs": {n: node_macs[n] for n in new}}
     if root:
@@ -1113,7 +1179,9 @@ def grow(model, loader, device, epoch: int, run_dir, max_nodes: int,
          policy: str = "cluster", link_policy: str = "none",
          val_loader=None, silhouette_min=None, purity_gain=None,
          leaf_init: str = "fresh", route_acc_min: float = 0.93,
-         branch_keep: float = 0.95) -> dict | None:
+         branch_keep: float = 0.95, probe_batches: int | None = None,
+         leaf_history: dict[str, list[float]] | None = None, plateau_delta: float = 0.03,
+         plateau_patience: int = 2) -> dict | None:
     """One growth step: cluster-split the leaf with the highest reach-weighted loss
     (ADR 0003), clustering the same batches the loss is measured on.
 
@@ -1126,20 +1194,28 @@ def grow(model, loader, device, epoch: int, run_dir, max_nodes: int,
     `new_nodes` lists only the fresh leaves.
 
     A `TreeModel` grows by a supervised binary split instead (only `max_nodes`,
-    `limit_batches`, `val_loader`, `route_acc_min` and `branch_keep` apply): the leaf with the highest
-    reach-weighted loss among those with at least 2 classes is split on its confusion
-    groups (from its validation confusion) at the earliest block whose probe head routes
-    them with validation accuracy >= `route_acc_min`, else at the last block (fallback
-    "last_block"). Probe heads train on frozen features of `limit_batches` training
-    batches; the new router starts from the winning probe's weights. The event adds
-    `groups`, `block`, `block_val_acc` (per probed block) and `fallback`. The root never
-    falls back and never splits at its last block (DECISIONS Q5, `choose_root_block`); its
-    events add `excluded_blocks: ["b4"]` (probed and logged, never chosen). If no other
-    block reaches the bar, nothing splits and the returned
-    and logged event is a miss, `{"epoch", "leaf", "skipped": "root_below_bar",
-    "num_nodes", "leaf_losses", "groups", "block_val_acc", "excluded_blocks"}`, with no
-    graph snapshot; the
-    next growth step probes again. Each branch keeps, per conv, the fewest channels carrying
+    `limit_batches`, `val_loader`, `route_acc_min`, `branch_keep`, `probe_batches` and the
+    settle arguments apply; DECISIONS Q11). Each step appends every leaf's validation loss
+    on its true-path images (`true_path_losses`, whole `val_loader`) to `leaf_history`
+    ({leaf: losses}, kept by the caller across steps; None = a fresh one). The eligible
+    leaves (at least 2 classes and a block of their own) are taken in order of
+    reach-weighted training loss (`limit_batches` batches), and the first that has
+    `plateaued` (`plateau_delta`, `plateau_patience`) acts. If none has, nothing changes or
+    is logged and the return is `{"epoch", "waiting": [eligible leaves, in order],
+    "val_losses": {leaf: latest}}`. The acting leaf is split on its confusion groups (from
+    its validation confusion) at the earliest block whose probe head routes them with
+    validation accuracy >= `route_acc_min` (`choose_split_block`; the root never at its last
+    block, `choose_root_block`, and its events add `excluded_blocks: ["b4"]`). Probe heads
+    train on frozen features of `probe_batches` training batches (None = all) and are
+    scored on the whole `val_loader`; the new router starts from the winning probe's
+    weights. The split event adds `plateau_losses` (the acting leaf's last `patience + 1`
+    validation losses), `groups`, `block`, `block_val_acc` (per probed block) and
+    `probe_images` (true-path training images the probes saw); the split leaf leaves
+    `leaf_history`. If no block reaches the bar, nothing splits and the returned and logged
+    event is a miss, `{"epoch", "leaf", "skipped": "below_bar", "num_nodes", "leaf_losses",
+    "plateau_losses", "groups", "block_val_acc"}` (+ `excluded_blocks` for the root), with
+    no graph snapshot; the leaf probes again at a later plateau. There is no fallback block.
+    Each branch keeps, per conv, the fewest channels carrying
     `branch_keep` of its group's activation mass on the probes' training batches
     (`keep_channels`; 1.0 is a full copy); split events add `branch_keep`,
     `branch_channels` ({new leaf: kept channels per conv}) and `branch_macs` ({new leaf:
@@ -1148,7 +1224,9 @@ def grow(model, loader, device, epoch: int, run_dir, max_nodes: int,
     """
     if isinstance(model, TreeModel):
         return _grow_tree(model, loader, device, epoch, run_dir, max_nodes, limit_batches,
-                          val_loader, route_acc_min, branch_keep)
+                          val_loader, route_acc_min, branch_keep, probe_batches,
+                          {} if leaf_history is None else leaf_history, plateau_delta,
+                          plateau_patience)
     room = min(max_k, max_nodes - len(model.graph.nodes))
     if room < 2:
         return None

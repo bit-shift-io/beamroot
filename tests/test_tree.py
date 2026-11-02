@@ -65,6 +65,8 @@ def test_train_run_tree_writes_model_and_metrics(tmp_path):
                         "--epochs", "1", "--limit-batches", "2", "--max-nodes", "1",
                         "--runs-dir", str(tmp_path)]))["run_dir"]
     assert (d / "metrics.jsonl").read_text().strip()
+    config = json.loads((d / "config.json").read_text())
+    assert config["tree_growth"] == "settle" and config["plateau_delta"] == 0.03  # Q11 default
     ckpt = torch.load(d / "model.pt")
     assert ckpt["kind"] == "tree"
     model, _ = load_run(d, "cpu")
@@ -285,15 +287,47 @@ def test_confusion_groups_of_two_classes_are_two_singletons():
     assert confusion_groups(torch.tensor([[9.0, 1.0], [2.0, 8.0]]), [7, 2]) == [[2], [7]]
 
 
+def one_class_confused_with_all(classes):
+    """Class `classes[0]` is a little, equally confused with every other class; the rest
+    form blocks {1, 2, 3} and {4, 5} (positions) with some confusion between the blocks."""
+    n = len(classes)
+    conf = torch.eye(n) * 100
+    for i in range(1, n):
+        conf[0, i] = conf[i, 0] = 2
+    for a, b in [(1, 2), (1, 3), (2, 3), (4, 5)]:
+        if b < n:
+            conf[a, b] = conf[b, a] = 20
+    for a in (1, 2, 3):
+        for b in (4, 5):
+            if b < n:
+                conf[a, b] = conf[b, a] = 6
+    return conf
+
+
+def test_confusion_groups_of_four_or_more_classes_have_no_singleton():
+    from beamroot.growth import confusion_groups
+    classes = [0, 2, 3, 5, 7, 9]
+    # The top cut peels class 0 off; the best qualifying cut has mean dissimilarity 0.9675
+    # against 0.9653 for the runner-up [[0, 2, 3, 5], [7, 9]].
+    assert confusion_groups(one_class_confused_with_all(classes), classes) \
+        == [[0, 7, 9], [2, 3, 5]]
+
+
+def test_confusion_groups_of_three_classes_may_still_give_a_singleton():
+    from beamroot.growth import confusion_groups
+    conf = one_class_confused_with_all([4, 1, 8])
+    assert confusion_groups(conf, [4, 1, 8]) == [[1, 8], [4]]
+
+
 def test_choose_split_block_picks_the_earliest_block_at_or_above_the_bar():
     from beamroot.growth import choose_split_block
     accs = {"b2": 0.90, "b3": 0.93, "b4": 0.97}
-    assert choose_split_block(accs, 0.93) == ("b3", None)
+    assert choose_split_block(accs, 0.93) == "b3"
 
 
-def test_choose_split_block_falls_back_to_the_last_block():
+def test_choose_split_block_has_no_fallback_when_no_block_passes():
     from beamroot.growth import choose_split_block
-    assert choose_split_block({"b1": 0.7, "b2": 0.95, "b3": 0.8}, 0.99) == ("b3", "last_block")
+    assert choose_split_block({"b1": 0.7, "b2": 0.95, "b3": 0.8}, 0.99) is None
 
 
 def group_data(n=512, seed=1):
@@ -338,17 +372,17 @@ def test_grow_splits_a_tree_leaf_on_its_confusion_groups_at_a_well_routed_block(
     train, val = group_data()
     tree = trained_leaf(train)
     event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=3, limit_batches=6,
-                 val_loader=val, route_acc_min=0.9)
+                 val_loader=val, route_acc_min=0.9, plateau_patience=0)
     assert event["split"] == "root" and event["groups"] == GROUPS
     assert list(event["block_val_acc"]) == ["b1", "b2", "b3", "b4"]
-    assert event["fallback"] is None and event["excluded_blocks"] == ["b4"]
+    assert "fallback" not in event and event["excluded_blocks"] == ["b4"]
     assert event["block_val_acc"][event["block"]] >= 0.9
     assert all(event["block_val_acc"][b] < 0.9 for b in event["block_val_acc"]
                if b < event["block"])
     assert tree.split_blocks == {"root": event["block"]} and tree.groups == {"root": GROUPS}
     assert route_acc(tree, "root", val) >= 0.9  # the router starts from the probe head
     logged = json.loads((tmp_path / "growth.jsonl").read_text().splitlines()[-1])
-    assert {"groups", "block", "block_val_acc", "fallback"} <= set(logged)
+    assert {"groups", "block", "block_val_acc", "plateau_losses"} <= set(logged)
     assert (tmp_path / "graphs" / "epoch_001.json").exists()
 
 
@@ -359,7 +393,7 @@ def test_tree_growth_leaves_training_rng_untouched(tmp_path):
     torch.manual_seed(123)
     cpu, shuffle = torch.get_rng_state(), train.generator.get_state()
     assert grow(tree, train, "cpu", 1, tmp_path, max_nodes=3, limit_batches=6,
-                val_loader=val) is not None
+                val_loader=val, plateau_patience=0) is not None
     assert torch.equal(torch.get_rng_state(), cpu)
     assert torch.equal(train.generator.get_state(), shuffle)
 
@@ -373,24 +407,29 @@ def test_grow_never_chooses_a_one_class_leaf(tmp_path):
         tree.nodes["leaf1"].head.linear.weight.mul_(100)
     losses = leaf_losses(tree, train, "cpu", 6)
     assert max(losses, key=losses.get) == "leaf1"
-    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=5, limit_batches=6, val_loader=val)
+    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=5, limit_batches=6, val_loader=val,
+                 plateau_patience=0)
     assert event["split"] == "leaf0" and set(event["block_val_acc"]) == {"b3", "b4"}
     assert grow(tree, train, "cpu", 2, tmp_path, max_nodes=7, limit_batches=6,
-                val_loader=val) is not None  # leaf1 is still never picked
+                val_loader=val, plateau_patience=0) is not None  # leaf1 is still never picked
     assert tree.graph.nodes["leaf1"].kind == "leaf"
 
 
 def test_train_run_grows_a_tree_and_logs_each_split(tmp_path, capsys):
     d = run(parse_args(["--dataset", "synthetic_cifar", "--model", "tree", "--device", "cpu",
-                        "--epochs", "3", "--width", "4", "--max-nodes", "5",
-                        "--route-acc-min", "0.9", "--runs-dir", str(tmp_path)]))["run_dir"]
-    events = [json.loads(s) for s in (d / "growth.jsonl").read_text().splitlines()]
-    assert [e["epoch"] for e in events] == [1, 2]
+                        "--epochs", "4", "--width", "4", "--max-nodes", "5",
+                        "--route-acc-min", "0.5", "--plateau-patience", "0",
+                        "--post-split-epochs", "2", "--runs-dir", str(tmp_path)]))["run_dir"]
+    logged = [json.loads(s) for s in (d / "growth.jsonl").read_text().splitlines()]
+    assert [(e["epoch"], e.get("skipped")) for e in logged] == [(1, None), (2, "below_bar"),
+                                                                 (3, None)]
+    events = [e for e in logged if "split" in e]
     for e in events:
-        assert {"groups", "block", "block_val_acc", "fallback"} <= set(e)
+        assert {"groups", "block", "block_val_acc"} <= set(e) and "fallback" not in e
         assert e["block"] in e["block_val_acc"]
     assert sorted(c for g in events[0]["groups"] for c in g) == list(range(10))
-    assert (d / "graphs" / "epoch_002.json").exists()
+    assert (d / "graphs" / "epoch_003.json").exists()
+    assert not (d / "graphs" / "epoch_002.json").exists()  # a skip changes nothing
     model, _ = load_run(d, "cpu")
     assert len(model.graph.nodes) == 5 and model.split_blocks[events[0]["split"]] == events[0]["block"]
     out = capsys.readouterr().out
@@ -425,40 +464,49 @@ def test_a_root_below_the_bar_is_not_split_until_a_later_step_passes(tmp_path):
     torch.manual_seed(123)
     cpu, shuffle = torch.get_rng_state(), train.generator.get_state()
     skip = grow(tree, train, "cpu", 1, tmp_path, max_nodes=3, limit_batches=6,
-                val_loader=val, route_acc_min=1.01)  # no block can reach it
+                val_loader=val, route_acc_min=1.01, plateau_patience=0)  # no block can reach it
     assert torch.equal(torch.get_rng_state(), cpu)  # the skip path leaves the RNG too
     assert torch.equal(train.generator.get_state(), shuffle)
-    assert skip["skipped"] == "root_below_bar" and "split" not in skip
+    assert skip["skipped"] == "below_bar" and "split" not in skip
     assert skip["leaf"] == "root" and skip["groups"] == GROUPS
     assert list(skip["block_val_acc"]) == ["b1", "b2", "b3", "b4"]
     assert list(tree.graph.nodes) == ["root"] and tree.split_blocks == {}
     assert not (tmp_path / "graphs").exists()
     event = grow(tree, train, "cpu", 2, tmp_path, max_nodes=3, limit_batches=6,
-                 val_loader=val, route_acc_min=0.9)
-    assert event["split"] == "root" and event["fallback"] is None
+                 val_loader=val, route_acc_min=0.9, plateau_patience=0)
+    assert event["split"] == "root" and "fallback" not in event
     logged = [json.loads(s) for s in (tmp_path / "growth.jsonl").read_text().splitlines()]
-    assert [e.get("skipped") for e in logged] == ["root_below_bar", None]
+    assert [e.get("skipped") for e in logged] == ["below_bar", None]
     assert logged[0]["epoch"] == 1 and logged[0]["block_val_acc"] == skip["block_val_acc"]
 
 
-def test_a_non_root_leaf_below_the_bar_falls_back_to_the_last_block(tmp_path):
+def test_a_non_root_leaf_below_the_bar_is_skipped_not_split(tmp_path):
     from beamroot.growth import grow, tree_split
     train, val = group_data()
     tree = trained_leaf(train, steps=1)
     tree_split(tree, "root", GROUPS, "b2")
+    torch.manual_seed(123)
+    cpu, shuffle = torch.get_rng_state(), train.generator.get_state()
     event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=5, limit_batches=6,
-                 val_loader=val, route_acc_min=1.01)
-    assert event["split"] in ("leaf0", "leaf1")
-    assert event["block"] == "b4" and event["fallback"] == "last_block"
+                 val_loader=val, route_acc_min=1.01, plateau_patience=0)
+    assert torch.equal(torch.get_rng_state(), cpu)
+    assert torch.equal(train.generator.get_state(), shuffle)
+    assert event["leaf"] in ("leaf0", "leaf1") and event["skipped"] == "below_bar"
+    assert "split" not in event and "fallback" not in event and "excluded_blocks" not in event
+    assert list(event["block_val_acc"]) == ["b3", "b4"]
+    assert list(tree.graph.nodes) == ["root", "leaf0", "leaf1"]
+    logged = json.loads((tmp_path / "growth.jsonl").read_text())
+    assert logged["skipped"] == "below_bar" and "fallback" not in logged
 
 
 def test_train_run_keeps_the_plain_network_while_the_root_misses_the_bar(tmp_path, capsys):
     d = run(parse_args(["--dataset", "synthetic_cifar", "--model", "tree", "--device", "cpu",
                         "--epochs", "3", "--width", "4", "--limit-batches", "2",
-                        "--route-acc-min", "1.01", "--runs-dir", str(tmp_path)]))["run_dir"]
+                        "--route-acc-min", "1.01", "--plateau-patience", "0",
+                        "--runs-dir", str(tmp_path)]))["run_dir"]
     events = [json.loads(s) for s in (d / "growth.jsonl").read_text().splitlines()]
-    assert [(e["epoch"], e["skipped"]) for e in events] == [(1, "root_below_bar"),
-                                                            (2, "root_below_bar")]
+    assert [(e["epoch"], e["skipped"]) for e in events] == [(1, "below_bar"),
+                                                            (2, "below_bar")]
     model, _ = load_run(d, "cpu")
     assert list(model.nodes) == ["root"]
     assert "root below route acc 1.01" in capsys.readouterr().out
@@ -573,7 +621,7 @@ def test_grow_narrows_each_branch_to_its_groups_activation_share_and_logs_it(tmp
     tree = trained_leaf(train)
     silence(tree.nodes["root"].segment[3][2], list(range(16)))  # half of b4's last conv
     event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=3, limit_batches=6,
-                 val_loader=val, route_acc_min=0.9, branch_keep=0.95)
+                 val_loader=val, route_acc_min=0.9, branch_keep=0.95, plateau_patience=0)
     new = event["new_nodes"]
     assert event["branch_keep"] == 0.95
     assert set(event["branch_channels"]) == set(new)
@@ -598,7 +646,7 @@ def test_grow_with_branch_keep_one_copies_the_branches_at_full_width(tmp_path):
     with torch.no_grad():
         before = tree.eval().nodes["root"](x)
     event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=3, limit_batches=6,
-                 val_loader=val, route_acc_min=0.9, branch_keep=1.0)
+                 val_loader=val, route_acc_min=0.9, branch_keep=1.0, plateau_patience=0)
     assert tree.channels == {}
     with torch.no_grad():
         for leaf in event["new_nodes"]:
@@ -616,10 +664,144 @@ def test_branch_keep_exits_for_other_models(tmp_path):
 def test_train_run_passes_branch_keep_to_tree_growth(tmp_path, capsys):
     d = run(parse_args(["--dataset", "synthetic_cifar", "--model", "tree", "--device", "cpu",
                         "--epochs", "2", "--width", "4", "--max-nodes", "3",
-                        "--route-acc-min", "0.5", "--branch-keep", "0.5",
+                        "--route-acc-min", "0.5", "--plateau-patience", "0", "--branch-keep", "0.5",
                         "--runs-dir", str(tmp_path)]))["run_dir"]
     (event,) = [json.loads(s) for s in (d / "growth.jsonl").read_text().splitlines()]
     assert event["branch_keep"] == 0.5
     model, _ = load_run(d, "cpu")
     assert {n: model.node_widths(n) for n in event["new_nodes"]} == event["branch_channels"]
     assert "channels" in capsys.readouterr().out
+
+
+def test_probes_train_on_all_true_path_training_images_by_default(tmp_path):
+    from beamroot.growth import grow
+    train, val = group_data()  # 384 training images in 6 batches of 64
+    tree = trained_leaf(train)
+    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=3, limit_batches=1,
+                 val_loader=val, route_acc_min=0.5, plateau_patience=0)
+    assert event["probe_images"] == 384  # not the one growth batch the leaf losses use
+    tree = trained_leaf(train)
+    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=3, limit_batches=1,
+                 val_loader=val, route_acc_min=0.5, probe_batches=2, plateau_patience=0)
+    assert event["probe_images"] == 128
+
+
+@pytest.mark.parametrize("flags", [["--probe-batches", "3"], ["--post-split-epochs", "2"]])
+def test_fair_growth_flags_exit_for_other_models(tmp_path, flags):
+    with pytest.raises(SystemExit, match="tree"):
+        run(parse_args(["--dataset", "synthetic", "--device", "cpu", "--epochs", "1",
+                        "--runs-dir", str(tmp_path), *flags]))
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_tree_run_trains_post_split_epochs_past_each_split(tmp_path):
+    d = run(parse_args(["--dataset", "synthetic_cifar", "--model", "tree", "--device", "cpu",
+                        "--epochs", "2", "--width", "4", "--max-nodes", "7",
+                        "--route-acc-min", "0.5", "--plateau-patience", "0",
+                        "--post-split-epochs", "3", "--runs-dir", str(tmp_path)]))["run_dir"]
+    logged = [json.loads(s) for s in (d / "growth.jsonl").read_text().splitlines()]
+    splits = [e["epoch"] for e in logged if "split" in e]
+    assert splits == [1, 3, 4]  # epoch 2 skipped; the later splits come in extended epochs
+    rows = [json.loads(s) for s in (d / "metrics.jsonl").read_text().splitlines()]
+    assert [r["epoch"] for r in rows] == [1, 2, 3, 4, 5, 6, 7]  # last split 4 + 3
+    assert rows[-1]["epochs_trained"] == 7
+
+
+def test_a_tree_run_that_never_splits_ends_at_epochs(tmp_path):
+    d = run(parse_args(["--dataset", "synthetic_cifar", "--model", "tree", "--device", "cpu",
+                        "--epochs", "2", "--limit-batches", "1", "--max-nodes", "1",
+                        "--runs-dir", str(tmp_path)]))["run_dir"]
+    rows = [json.loads(s) for s in (d / "metrics.jsonl").read_text().splitlines()]
+    assert [r["epoch"] for r in rows] == [1, 2] and rows[-1]["epochs_trained"] == 2
+
+
+@pytest.mark.parametrize("flags, images", [([], 224), (["--probe-batches", "1"], 128)])
+def test_train_run_passes_probe_batches_to_tree_growth(tmp_path, flags, images):
+    d = run(parse_args(["--dataset", "synthetic_cifar", "--model", "tree", "--device", "cpu",
+                        "--epochs", "2", "--width", "4", "--max-nodes", "3",
+                        "--growth-batches", "1", "--route-acc-min", "0.5",
+                        "--plateau-patience", "0",
+                        "--runs-dir", str(tmp_path), *flags]))["run_dir"]
+    (event,) = [json.loads(s) for s in (d / "growth.jsonl").read_text().splitlines()]
+    assert event["probe_images"] == images  # 224 training images in batches of 128
+
+
+def test_a_tree_defaults_to_width_16_and_other_models_keep_the_dataset_width(tmp_path):
+    from beamroot.train import build_model
+    d = run(parse_args(["--dataset", "synthetic_cifar", "--model", "tree", "--device", "cpu",
+                        "--epochs", "1", "--limit-batches", "1", "--max-nodes", "1",
+                        "--runs-dir", str(tmp_path)]))["run_dir"]
+    assert json.loads((d / "config.json").read_text())["width"] == 16
+    assert load_run(d, "cpu")[0].config["width"] == 16
+    assert build_model("tree", "cifar10").config["width"] == 16
+    assert build_model("tree", "cifar10", width=8).config["width"] == 8
+    assert build_model("dag", "cifar10").config["width"] == 32
+
+
+def test_a_leaf_plateaus_once_its_loss_improves_less_than_delta_over_patience_epochs():
+    from beamroot.growth import plateaued
+    history = [1.0]
+    for gain in (0.05, 0.03, 0.005, 0.004):
+        history.append(history[-1] * (1 - gain))
+    assert [plateaued(history[:n], 0.01, 2) for n in range(1, 6)] == [False] * 4 + [True]
+    assert not plateaued([1.0, 1.0], 0.01, 2)  # fewer than patience + 1 measurements
+    assert not plateaued([], 0.01, 2)
+    assert plateaued([1.0, 1.2, 1.1], 0.01, 2)  # no net improvement
+    assert plateaued([0.7], 0.01, 0)  # patience 0: a leaf acts at its first measurement
+
+
+def test_the_first_plateaued_leaf_acts_even_when_another_has_the_higher_loss(tmp_path):
+    from beamroot.growth import grow, leaf_losses, tree_split
+    train, val = group_data()
+    tree = trained_leaf(train, steps=1)
+    tree_split(tree, "root", GROUPS, "b2")
+    losses = leaf_losses(tree, train, "cpu", 6)
+    worse, calm = sorted(losses, key=losses.get, reverse=True)
+    history = {worse: [1e3], calm: [1e-4]}  # the next measurement: worse improves, calm not
+    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=5, limit_batches=6,
+                 val_loader=val, route_acc_min=0.0, leaf_history=history, plateau_patience=1)
+    assert event["split"] == calm and event["plateau_losses"][0] == 1e-4
+    assert calm not in history and len(history[worse]) == 2
+    assert not set(event["new_nodes"]) & set(history)  # new leaves start with no history
+
+
+def test_no_plateaued_leaf_waits_without_logging_or_touching_the_rng(tmp_path):
+    from beamroot.growth import grow
+    train, val = group_data()
+    tree = trained_leaf(train)
+    history = {}
+    torch.manual_seed(123)
+    cpu, shuffle = torch.get_rng_state(), train.generator.get_state()
+    event = grow(tree, train, "cpu", 1, tmp_path, max_nodes=3, limit_batches=6,
+                 val_loader=val, route_acc_min=0.0, leaf_history=history)
+    assert torch.equal(torch.get_rng_state(), cpu)
+    assert torch.equal(train.generator.get_state(), shuffle)
+    assert event["waiting"] == ["root"] and set(event["val_losses"]) == {"root"}
+    assert len(history["root"]) == 1 and list(tree.graph.nodes) == ["root"]
+    assert not (tmp_path / "growth.jsonl").exists()
+
+
+def test_a_tree_run_waits_for_a_leaf_to_settle_and_skips_do_not_move_the_end(tmp_path, capsys):
+    d = run(parse_args(["--dataset", "synthetic_cifar", "--model", "tree", "--device", "cpu",
+                        "--epochs", "5", "--width", "4", "--limit-batches", "2",
+                        "--max-nodes", "3", "--plateau-delta", "1.0",
+                        "--route-acc-min", "1.01", "--runs-dir", str(tmp_path)]))["run_dir"]
+    events = [json.loads(s) for s in (d / "growth.jsonl").read_text().splitlines()]
+    # default patience 2: the root first acts at its third measurement, epoch 3
+    assert [(e["epoch"], e["skipped"]) for e in events] == [(3, "below_bar"), (4, "below_bar")]
+    assert len(events[0]["plateau_losses"]) == 3
+    rows = [json.loads(s) for s in (d / "metrics.jsonl").read_text().splitlines()]
+    assert rows[-1]["epochs_trained"] == 5  # skips never extend the run
+    out = capsys.readouterr().out
+    assert "waiting: root" in out and "root below route acc 1.01" in out
+    config = json.loads((d / "config.json").read_text())
+    assert config["tree_growth"] == "settle" and config["plateau_patience"] == 2
+
+
+@pytest.mark.parametrize("flags", [["--tree-growth", "settle"], ["--plateau-delta", "0.05"],
+                                   ["--plateau-patience", "3"]])
+def test_settle_flags_exit_for_other_models(tmp_path, flags):
+    with pytest.raises(SystemExit, match="tree"):
+        run(parse_args(["--dataset", "synthetic", "--device", "cpu", "--epochs", "1",
+                        "--runs-dir", str(tmp_path), *flags]))
+    assert not list(tmp_path.iterdir())

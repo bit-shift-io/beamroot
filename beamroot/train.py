@@ -24,6 +24,7 @@ PRESETS = {
     "explainable": {"max_k": 4, "split_policy": "cluster", "link_policy": "none"},  # unsupervised
     "pure": {"max_k": 4, "split_policy": "class", "link_policy": "none"},  # supervised
 }
+TREE_WIDTH = 16  # --model tree default whatever the dataset: the 0007 deep4 (DECISIONS Q7)
 
 
 def evaluate(model, loader, device, limit_batches=None):
@@ -94,7 +95,7 @@ def build_model(name: str, dataset: str = "mnist", width: int | None = None,
                 hidden: int | None = None, size_axis: str = "both", start_step: int = 4,
                 leaf: str = "classifier"):
     info = dataset_info(dataset)
-    width = width or info["width"]
+    width = width or (TREE_WIDTH if name == "tree" else info["width"])
     dims = {"in_channels": info["channels"], "image_size": info["image_size"],
             "num_classes": info["num_classes"], "width": width}
     if name == "baseline":
@@ -143,6 +144,14 @@ def run(args, after_epoch=None) -> dict:
         raise SystemExit("--route-acc-min only applies to --model tree")
     if args.model != "tree" and args.branch_keep != 0.95:
         raise SystemExit("--branch-keep only applies to --model tree")
+    if args.model != "tree" and args.probe_batches is not None:
+        raise SystemExit("--probe-batches only applies to --model tree")
+    if args.model != "tree" and args.post_split_epochs != 15:
+        raise SystemExit("--post-split-epochs only applies to --model tree")
+    if args.model != "tree" and (args.tree_growth is not None or args.plateau_delta != 0.03
+                                 or args.plateau_patience != 2):
+        raise SystemExit("--tree-growth, --plateau-delta and --plateau-patience only apply "
+                         "to --model tree")
     if args.model == "tree":
         if args.merge:
             raise SystemExit("--merge does not apply to --model tree")
@@ -174,6 +183,10 @@ def run(args, after_epoch=None) -> dict:
         args.dataset, args.batch_size, args.seed, args.val_size)
     if args.epochs is None:
         args.epochs = dataset_info(args.dataset)["epochs"]
+    if args.model == "tree" and args.width is None:  # config.json records the resolved width
+        args.width = TREE_WIDTH
+    if args.model == "tree" and args.tree_growth is None:
+        args.tree_growth = "settle"
     if args.match_params:
         if args.model != "baseline":
             raise SystemExit("--match-params only applies to --model baseline")
@@ -193,7 +206,11 @@ def run(args, after_epoch=None) -> dict:
         save_graph_snapshot(model, run_dir, 0)
     first_loss, last = None, {}
     fresh = []  # the latest split's new leaves; never merge candidates
-    for epoch in range(1, args.epochs + 1):
+    end = args.epochs  # a tree split moves it to at least --post-split-epochs later (Q10)
+    leaf_history = {}  # tree: each leaf's validation loss per growth epoch (settle, Q11)
+    epoch = 0
+    while epoch < end:
+        epoch += 1
         t0 = time.time()
         stats, parts = {}, {}
         if args.model == "cascade":
@@ -217,6 +234,8 @@ def run(args, after_epoch=None) -> dict:
             last["routing"] = stats
         if isinstance(model, DAGRouterModel):
             last["num_nodes"] = len(model.graph.nodes)
+        if isinstance(model, TreeModel) and epoch == end:  # growth never moves the last epoch
+            last["epochs_trained"] = epoch
         log_metrics(run_dir, last)
         for name, s in stats.items():
             if "usage" not in s:  # tree leaves carry only purity
@@ -233,8 +252,8 @@ def run(args, after_epoch=None) -> dict:
                 print(f"  freeze {f['freeze']} (entropy {f['entropy']:.3f} "
                       f"spread {f['spread']:.3f})", flush=True)
         # Grow after training on the current graph; never after the last epoch.
-        if (growing and epoch % args.grow_every == 0 and epoch < args.epochs
-                and args.epochs - epoch >= args.settle_epochs):
+        if (growing and epoch % args.grow_every == 0 and epoch < end
+                and end - epoch >= args.settle_epochs):
             merges = []
             if args.merge:  # merge first so freed nodes count towards the split budget
                 merges = merge_step(model, val_loader, device, epoch, run_dir,
@@ -262,20 +281,30 @@ def run(args, after_epoch=None) -> dict:
                                          else None),
                          purity_gain=(args.purity_gain if args.purity_check else None),
                          leaf_init=args.leaf_init, route_acc_min=args.route_acc_min,
-                         branch_keep=args.branch_keep)
-            if event and event.get("skipped"):  # tree root missed the bar: nothing changed
+                         branch_keep=args.branch_keep, probe_batches=args.probe_batches,
+                         leaf_history=leaf_history, plateau_delta=args.plateau_delta,
+                         plateau_patience=args.plateau_patience)
+            if event and "waiting" in event:  # no tree leaf has settled: nothing changed
+                losses = ", ".join(f"{n} {v:.4f}" for n, v in event["val_losses"].items())
+                print(f"  waiting: {', '.join(event['waiting'])} (val loss {losses})",
+                      flush=True)
+                event = None
+            if event and event.get("skipped"):  # a tree leaf missed the bar: nothing changed
                 accs = {b: round(a, 3) for b, a in event["block_val_acc"].items()}
                 print(f"  no split: {event['leaf']} below route acc {args.route_acc_min} "
-                      f"groups {event['groups']} route acc {accs}", flush=True)
+                      f"groups {event['groups']} route acc {accs} plateau losses "
+                      f"{[round(v, 4) for v in event['plateau_losses']]}", flush=True)
                 event = None
             fresh = event["new_nodes"] if event else []  # fresh leaves only, not linked ones
             if event or merges or any('to' in b for b in bumps):
                 opt = rebuild_optimizer(model, opt, lr=args.lr)
             if event and isinstance(model, TreeModel):
+                end = max(end, epoch + args.post_split_epochs)
                 accs = {b: round(a, 3) for b, a in event["block_val_acc"].items()}
                 print(f"  split {event['split']} -> {event['new_nodes']} at {event['block']} "
-                      f"groups {event['groups']} route acc {accs} "
-                      f"fallback {event['fallback']} ({event['num_nodes']} nodes)", flush=True)
+                      f"groups {event['groups']} route acc {accs} plateau losses "
+                      f"{[round(v, 4) for v in event['plateau_losses']]} "
+                      f"({event['num_nodes']} nodes)", flush=True)
                 for n in event["new_nodes"]:
                     print(f"    {n} channels {event['branch_channels'][n]} "
                           f"MACs {event['branch_macs'][n] / 1e6:.2f}M", flush=True)
@@ -392,12 +421,28 @@ def parse_args(argv=None):
                         "images is below half the split leaf's. Default from --preset")
     p.add_argument("--route-acc-min", type=float, default=0.93,
                    help="tree only: split at the earliest block whose probe head routes the "
-                        "confusion groups with at least this validation accuracy (else the "
-                        "last block)")
+                        "confusion groups with at least this validation accuracy (else skip "
+                        "and probe again at a later plateau)")
+    p.add_argument("--tree-growth", choices=["settle"], default=None,
+                   help="tree only: how a tree grows. settle = a leaf acts once its "
+                        "validation loss has plateaued (default)")
+    p.add_argument("--plateau-delta", type=float, default=0.03,
+                   help="tree only: a leaf has plateaued when its true-path validation loss "
+                        "improved by less than this share over the last --plateau-patience "
+                        "growth epochs")
+    p.add_argument("--plateau-patience", type=int, default=2,
+                   help="tree only: growth epochs the plateau rule looks back over "
+                        "(0 = a leaf acts at once)")
     p.add_argument("--branch-keep", type=float, default=0.95,
                    help="tree only: at a split each branch keeps, per conv, the fewest "
                         "channels carrying this share of its group's activation mass "
                         "(1.0 copies the parent's blocks at full width)")
+    p.add_argument("--probe-batches", type=int, default=None,
+                   help="tree only: training batches whose true-path images train the probe "
+                        "heads and measure branch-keep activation mass (default: all)")
+    p.add_argument("--post-split-epochs", type=int, default=15,
+                   help="tree only: train at least this many epochs after the last split; "
+                        "the run ends at the later of --epochs and that")
     p.add_argument("--growth-batches", type=int, default=50,
                    help="training batches used to measure per-leaf loss and to cluster "
                         "the chosen leaf's images before a split (and validation batches "
